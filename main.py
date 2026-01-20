@@ -9,9 +9,11 @@ import sys
 # 👉 Lấy tại: aistudio.google.com (Tạo Project mới cho sạch lỗi)
 KEY_GOOGLE_MOI = ""
 
+
 # 2. KEY GROQ (Để làm "Não" trả lời)
 # 👉 Lấy tại: console.groq.com
 KEY_GROQ_CUA_BAN = ""
+
 
 # ==============================================================================
 
@@ -62,13 +64,13 @@ def main():
         return
 
     # ---------------------------------------------------------
-    # 2. BỘ NÃO (CHAT) -> DÙNG GROQ MODEL NÀY
+    # 2. BỘ NÃO (CHAT) -> DÙNG GROQ 
     # ---------------------------------------------------------
     print("🔌 Đang kết nối não bộ Groq (Llama 3.3)...")
     try:
         llm = ChatGroq(
             temperature=0,
-            # 👇 MODEL MỚI NHẤT CỦA GROQ 👇
+            
             model_name="llama-3.3-70b-versatile", 
             api_key=GROQ_API_KEY
         )
