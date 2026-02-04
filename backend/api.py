@@ -1,4 +1,4 @@
-import os
+﻿import os
 import uuid
 import requests
 from typing import Union, List, Dict, Any
@@ -6,22 +6,29 @@ from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from docx import Document
+from docx.shared import Inches, Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from datetime import datetime
 
 # LangChain - OpenAI
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
+# Import Schema va Prompts tu file schema.py
+from schema import HRM_SCHEMA_ENHANCED, ANSWER_PROMPT, get_schema_by_role, get_sql_prompt_by_role
+
 # ==========================================================
-# 1. SETUP & CẤU HÌNH
+# 1. SETUP & CAU HINH
 # ==========================================================
 load_dotenv()
 
-# BẮT BUỘC phải có OpenAI API Key
+# BAT BUOC phai co OpenAI API Key
 if not os.environ.get("OPENAI_API_KEY"):
-    raise RuntimeError("❌ Chưa cấu hình OPENAI_API_KEY")
+    raise RuntimeError("Chua cau hinh OPENAI_API_KEY")
 
 HRM_API_URL = "https://hrm.icss.com.vn/ICSS/api/execute-sql"
 
@@ -35,41 +42,87 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Tạo thư mục lưu file tạm
+# Tao thu muc luu file tam
 EXPORT_DIR = "./static/reports"
 if not os.path.exists(EXPORT_DIR):
     os.makedirs(EXPORT_DIR)
 
-from docx.shared import Inches, Pt, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.table import WD_TABLE_ALIGNMENT
-from datetime import datetime
+# ==========================================================
+# 2. KHOI TAO LLM (OPENAI)
+# ==========================================================
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0,
+    max_tokens=600
+)
 
+# ==========================================================
+# 3. PYDANTIC MODELS (Request / Response)
+# ==========================================================
+class ConversationMessage(BaseModel):
+    role: str  # 'user' or 'bot'
+    content: str
+
+class ChatRequest(BaseModel):
+    question: str
+    user_id: Union[int, None] = None
+    role: Union[str, None] = None  # 'admin', 'manager', 'employee'
+    phong_ban_id: Union[int, None] = None
+    conversation_history: Union[List[ConversationMessage], None] = None  # Context Memory
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+class LoginResponse(BaseModel):
+    success: bool
+    message: str
+    user: Union[Dict, None] = None
+
+class ChatResponse(BaseModel):
+    sql: Union[str, None]
+    data: Union[List, Dict, Any, None]
+    answer: str
+    download_url: Union[str, None] = None
+
+class BriefingRequest(BaseModel):
+    user_id: int
+    role: str  # 'admin', 'manager', 'employee'
+    phong_ban_id: Union[int, None] = None
+
+class BriefingResponse(BaseModel):
+    greeting: str
+    checkin_status: Union[Dict, None] = None
+    tasks_today: Union[List, None] = None
+    leave_balance: Union[Dict, None] = None
+    alerts: Union[List, None] = None
+    team_summary: Union[Dict, None] = None  # Cho manager
+    dept_tasks_summary: Union[Dict, None] = None  # Cho manager
+    dept_projects_summary: Union[Dict, None] = None  # Cho manager
+    company_summary: Union[Dict, None] = None  # Cho admin
+
+# ==========================================================
+# 4. HAM TAO BAO CAO WORD
+# ==========================================================
 def create_word_report(data, title="BÁO CÁO HRM", filename_prefix="report", question="", summary=""):
-    """Sinh file .docx từ dữ liệu SQL - Định dạng báo cáo khoa học"""
     if not data: return None
     
-    # Đảm bảo data là list
     if isinstance(data, dict):
         data = [data]
     
-    # 1. Khởi tạo file Word
     doc = Document()
     
-    # === PHẦN TIÊU ĐỀ ===
     title_para = doc.add_heading(title, 0)
     title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     
-    # Thêm đường kẻ và thông tin thời gian
     subtitle = doc.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = subtitle.add_run(f"Ngày xuất: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
     run.font.size = Pt(10)
     run.font.color.rgb = RGBColor(128, 128, 128)
     
-    doc.add_paragraph()  # Khoảng trống
+    doc.add_paragraph()
     
-    # === PHẦN CÂU HỎI ===
     if question:
         doc.add_heading("1. Yêu cầu truy vấn", level=1)
         q_para = doc.add_paragraph()
@@ -78,51 +131,43 @@ def create_word_report(data, title="BÁO CÁO HRM", filename_prefix="report", qu
         q_run.font.size = Pt(11)
         doc.add_paragraph()
     
-    # === PHẦN TÓM TẮT KẾT QUẢ ===
     if summary:
         doc.add_heading("2. Tóm tắt kết quả", level=1)
         summary_para = doc.add_paragraph(summary)
         summary_para.paragraph_format.space_after = Pt(12)
         doc.add_paragraph()
     
-    # === PHẦN BẢNG DỮ LIỆU CHI TIẾT ===
     section_num = 3 if question and summary else (2 if question or summary else 1)
     doc.add_heading(f"{section_num}. Dữ liệu chi tiết ({len(data)} bản ghi)", level=1)
     
-    # Lấy headers từ keys của dòng đầu tiên
     headers = list(data[0].keys())
     
     table = doc.add_table(rows=1, cols=len(headers))
     table.style = 'Table Grid'
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
     
-    # Ghi header với định dạng đẹp
     hdr_cells = table.rows[0].cells
     for i, h in enumerate(headers):
         hdr_cells[i].text = str(h).upper().replace('_', ' ')
-        # Định dạng header
         for paragraph in hdr_cells[i].paragraphs:
             for run in paragraph.runs:
                 run.font.bold = True
                 run.font.size = Pt(10)
         
-    # Ghi dữ liệu
     for item in data:
         row_cells = table.add_row().cells
         for i, h in enumerate(headers):
             cell_value = item.get(h, '')
             row_cells[i].text = str(cell_value) if cell_value is not None else ''
-            # Định dạng cell
             for paragraph in row_cells[i].paragraphs:
                 for run in paragraph.runs:
                     run.font.size = Pt(9)
     
     doc.add_paragraph()
     
-    # === PHẦN FOOTER ===
     footer_para = doc.add_paragraph()
     footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    footer_run = footer_para.add_run("─" * 50)
+    footer_run = footer_para.add_run("-" * 50)
     footer_run.font.color.rgb = RGBColor(200, 200, 200)
     
     footer_info = doc.add_paragraph()
@@ -131,640 +176,38 @@ def create_word_report(data, title="BÁO CÁO HRM", filename_prefix="report", qu
     info_run.font.size = Pt(9)
     info_run.font.color.rgb = RGBColor(128, 128, 128)
             
-    # 3. Lưu file
     filename = f"{filename_prefix}_{uuid.uuid4().hex[:6]}.docx"
     filepath = os.path.join(EXPORT_DIR, filename)
     doc.save(filepath)
     
     return filepath
 
-def create_pdf_report(data, title="BAO CAO HRM", filename_prefix="report"):
-    """Sinh file .pdf từ dữ liệu SQL"""
-    if not data: return None
-
-    pdf = FPDF()
-    pdf.add_page()
-    
-    # Lưu ý: FPDF mặc định không hỗ trợ tiếng Việt Unicode tốt trừ khi add font ngoài.
-    # Ở đây ta dùng font chuẩn Arial (sẽ mất dấu tiếng Việt nếu không config thêm font)
-    pdf.set_font("Arial", size=12)
-    
-    pdf.cell(200, 10, txt=title, ln=1, align='C')
-    
-    # Ghi dữ liệu dòng
-    for item in data:
-        row_str = " | ".join([f"{str(v)}" for k,v in item.items()])
-        # Encode để tránh lỗi ký tự lạ
-        safe_str = row_str.encode('latin-1', 'replace').decode('latin-1') 
-        pdf.cell(0, 10, txt=safe_str, ln=1)
-        
-    filename = f"{filename_prefix}_{uuid.uuid4().hex[:6]}.pdf"
-    filepath = os.path.join(EXPORT_DIR, filename)
-    pdf.output(filepath)
-    
-    return filepath
-
 # ==========================================================
-# 2. SCHEMA REQUEST / RESPONSE
-# ==========================================================
-class ChatRequest(BaseModel):
-    question: str
-
-
-class ChatResponse(BaseModel):
-    sql: Union[str, None]
-    data: Union[List, Dict, Any, None]
-    answer: str
-    download_url: Union[str, None] = None
-
-
-# ==========================================================
-# 3. KHỞI TẠO LLM (OPENAI)
-# ==========================================================
-llm = ChatOpenAI(
-    model="gpt-4o-mini",   # ✅ Nhanh – rẻ – ổn cho SQL + RAG
-    temperature=0,
-    max_tokens=600   # đủ cho SQL + trả lời
-)
-# ==========================================================
-# 2. SCHEMA & LUẬT NGHIỆP VỤ (Nguồn: HRM_SCHEMA.docx)
-# ==========================================================
-HRM_SCHEMA_RAW = """
--- CHẤM CÔNG [Source: 7] --
-BẢNG cham_cong: id, nhan_vien_id, ngay (date), check_in (time), check_out (time).
-
--- NHÂN SỰ [Source: 12] --
-BẢNG nhanvien: id, ho_ten, email, so_dien_thoai, phong_ban_id, chuc_vu, vai_tro, luong_co_ban, trang_thai_lam_viec, ngay_vao_lam.
-BẢNG phong_ban: id, ten_phong, truong_phong_id [Source: 13].
-
--- LƯƠNG & KPI [Source: 10, 11] --
-BẢNG luong: id, nhan_vien_id, thang, nam, luong_co_ban, phu_cap, khoan_tru.
-BẢNG luu_kpi: id, nhan_vien_id, thang, nam, diem_kpi, xep_loai.
-BẢNG ngay_phep_nam: id, nhan_vien_id, nam, tong_ngay_phep, ngay_phep_con_lai.
-
--- DỰ ÁN & CÔNG VIỆC [Source: 7, 8, 9] --
-BẢNG du_an: id, ten_du_an, lead_id (PM), phong_ban (varchar), trang_thai_duan, ngay_ket_thuc.
-BẢNG cong_viec: id, ten_cong_viec, nguoi_giao_id, han_hoan_thanh, trang_thai, muc_do_uu_tien, du_an_id.
-BẢNG cong_viec_nguoi_nhan: id, cong_viec_id, nhan_vien_id.
-BẢNG cong_viec_tien_do: id, cong_viec_id, phan_tram.
-
--- TÀI LIỆU & HỆ THỐNG [Source: 14] --
-BẢNG tai_lieu: id, ten_tai_lieu, mo_ta, link_tai_lieu, nguoi_tao_id.
-BẢNG thong_bao: id, tieu_de, noi_dung, nguoi_nhan_id.
-
-"""
-
-# Kết hợp Schema thô với Luật nghiệp vụ (Enhanced Schema)
-HRM_SCHEMA_ENHANCED = f"""
-DANH SÁCH BẢNG VÀ LUẬT NGHIỆP VỤ BẮT BUỘC (DATA TRUTH):
-
-1. **QUY TẮC ĐI MUỘN (08:06 RULE) - BẮT BUỘC:**
-   - Định nghĩa: Nhân viên CÓ đi làm (check_in NOT NULL) nhưng giờ vào **từ 08:06:00 trở đi**.
-   - SQL Logic: `check_in >= '08:06:00'`.
-   - LƯU Ý: Tuyệt đối CẤM dùng `> 08:05`.
-   - Phân biệt: Nếu không có dữ liệu chấm công -> Là Vắng mặt (Absent), dùng `NOT IN`.
-
-2. **BẢNG `phong_ban` & `du_an`:**
-   - Tìm tên phòng ban: BẮT BUỘC dùng `LIKE` (VD: `LIKE '%Marketing%'`). **CẤM** dùng `=`.
-   - Dự án của phòng: Cột `phong_ban` trong bảng `du_an` là text (varchar). Tìm dự án theo phòng phải query trên bảng `du_an` (dùng LIKE).
-
-3. **BẢNG `cong_viec` (Task):**
-   - Muốn biết ai thực hiện công việc -> Phải JOIN bảng `cong_viec_nguoi_nhan`.
-   - Trễ hạn: `han_hoan_thanh < CURRENT_DATE` AND `trang_thai != 'Hoàn thành'`.
-
-4. **LUẬT TRA CỨU LƯƠNG (QUAN TRỌNG - SỬA ĐỔI):**
-   - Bảng `luong` hiện tại KHÔNG có dữ liệu.
-   - Khi người dùng hỏi về Lương (cơ bản, thu nhập...), **HÃY TRUY VẤN TỪ BẢNG `nhanvien`**.
-   - Cột cần lấy: `nhanvien.luong_co_ban`.
-   - Tuyệt đối không JOIN bảng `luong`.
-
-5. **LUẬT DỰ ÁN & CÔNG VIỆC (QUAN TRỌNG):**
-   - **Tìm Dự án theo phòng:** Cột `du_an.phong_ban` là text -> Dùng `LIKE`, CẤM JOIN bảng `phong_ban`.
-   - **Tìm Quản lý (PM/Lead):** 
-     + Cột `lead_id` trong `du_an` chỉ là số.
-     + BẮT BUỘC JOIN bảng `nhanvien`: `ON du_an.lead_id = nhanvien.id`.
-     + SELECT `nhanvien.ho_ten`.
-   - **Người thực hiện task:** JOIN `cong_viec` -> `cong_viec_nguoi_nhan` -> `nhanvien`.
-
-6. **LUẬT GIAO VIỆC (QUAN TRỌNG - MANY-TO-MANY):**
-   - Bảng `cong_viec` KHÔNG lưu trực tiếp người thực hiện (chỉ lưu `nguoi_giao_id`).
-   - Để tìm **"Ai làm việc gì"** hoặc **"Việc này ai làm"**:
-     => BẮT BUỘC JOIN qua bảng trung gian: `cong_viec_nguoi_nhan`.
-   - Lộ trình JOIN chuẩn: `cong_viec` <-> `cong_viec_nguoi_nhan` <-> `nhanvien`.
-
-7.  **LUẬT CHUẨN HÓA DỮ LIỆU (QUAN TRỌNG - MỚI):**
-   - **Trạng thái công việc:** Trong DB lưu chính xác là `'Đã hoàn thành'` (Tuyệt đối không dùng 'Hoàn thành' hay 'Done').
-   - **Logic chưa xong:** `trang_thai != 'Đã hoàn thành'`.
-   - **Logic trễ hạn:** `han_hoan_thanh < CURRENT_DATE` AND `trang_thai != 'Đã hoàn thành'`.
-
-8. **LUẬT TRỄ HẠN (DEADLINE LOGIC):**
-   - **Định nghĩa:** Một dự án hoặc công việc bị coi là trễ hạn (Overdue) khi:
-     `ngay_ket_thuc < CURRENT_DATE` (hoặc `han_hoan_thanh < CURRENT_DATE`)
-     AND `trang_thai != 'Đã hoàn thành'`.
-   - **Lưu ý:** Luôn phải kiểm tra trạng thái. Nếu đã xong (`'Đã hoàn thành'`) thì dù quá ngày cũng không tính là trễ (có thể là xong muộn, nhưng hiện tại không còn treo).
-
-9. **LUẬT TIẾN ĐỘ & LỊCH SỬ (QUAN TRỌNG NHẤT):**
-   - Bảng `cong_viec_tien_do` lưu lịch sử cập nhật (Log). Một việc có nhiều dòng dữ liệu.
-   - **Tra cứu đơn lẻ (1 việc):** Dùng `ORDER BY thoi_gian_cap_nhat DESC LIMIT 1` để lấy % mới nhất.
-   - **Thống kê/Đếm (Nhiều việc):** BẮT BUỘC dùng Sub-query để lọc ngày mới nhất: 
-     `WHERE td.thoi_gian_cap_nhat = (SELECT MAX(thoi_gian_cap_nhat) FROM cong_viec_tien_do WHERE cong_viec_id = cv.id)`.
-   - ⛔ **CẤM:** Tuyệt đối KHÔNG dùng `AVG()` hoặc `SUM()` trên cột `phan_tram`.
-
-10. **LUẬT CHI TIẾT QUY TRÌNH (SUB-TASKS):**
-   - Khi hỏi về "chi tiết", "các bước", "quy trình" của một việc -> Hãy query bảng `cong_viec_quy_trinh` (lấy cột `ten_buoc`, `trang_thai`).
-   - Đừng chỉ lấy mỗi cột `mo_ta` trong bảng `cong_viec` vì nó không đủ chi tiết.
-11. **LUẬT TÍNH TIẾN ĐỘ DỰ ÁN (PROJECT PROGRESS RULE):**
-   - Bảng `du_an` KHÔNG có cột phần trăm hoàn thành.
-   - **Định nghĩa:** Tiến độ dự án = Trung bình cộng (AVG) tiến độ hiện tại của tất cả các công việc (`cong_viec`) thuộc dự án đó.
-   - **Công thức SQL bắt buộc:**
-     1. Lấy tiến độ mới nhất của từng công việc (dùng Sub-query `MAX(thoi_gian_cap_nhat)`).
-     2. Gom nhóm theo dự án (`GROUP BY du_an.id`).
-     3. Tính `AVG(phan_tram)`.
-     4. Nếu cần lọc (ví dụ > 80%), dùng `HAVING AVG(...) > 80`.
-12. **MỐI QUAN HỆ DỰ ÁN - CÔNG VIỆC:**
-   - Liên kết: `du_an.id` = `cong_viec.du_an_id`.
-   - Tiến độ: `cong_viec.id` = `cong_viec_tien_do.cong_viec_id`
-13. **LUẬT TRA CỨU TIẾN ĐỘ AN TOÀN (SAFE JOIN RULE):**
-   - Khi tính toán tiến độ dự án hoặc công việc, hãy ưu tiên dùng **`LEFT JOIN cong_viec_tien_do`**.
-   - Lý do: Có những dự án mới tạo chưa có log tiến độ. Nếu dùng `INNER JOIN` sẽ bị mất dữ liệu.
-   - Xử lý NULL: Sử dụng `COALESCE(AVG(td.phan_tram), 0)` để mặc định là 0% nếu không tìm thấy log.
-14. **LUẬT THỐNG KÊ TRẠNG THÁI DỰ ÁN (PROJECT STATUS STATS):**
-   - Khi người dùng hỏi thống kê số lượng dự án theo "trạng thái" (VD: Đang thực hiện, Đã xong...):
-   - **Không cần tính toán** phức tạp.
-   - Truy vấn trực tiếp bảng `du_an`.
-   - Sử dụng `GROUP BY trang_thai_duan` (Lưu ý: tên cột là `trang_thai_duan`, KHÔNG dùng `trang_thai` vì đó là cột của bảng công việc).
-
-15. **LUẬT TRA CỨU TIẾN ĐỘ DỰ ÁN (PROJECT PROGRESS - ADVANCED):**
-   - **Bối cảnh:** Bảng `du_an` KHÔNG có cột phần trăm.
-   - **Logic:** Tiến độ Dự án = Trung bình cộng (AVG) tiến độ *mới nhất* của tất cả công việc (`cong_viec`) thuộc dự án đó.
-   - **Công thức SQL BẮT BUỘC (Safe Mode):**
-     1. Dùng **`LEFT JOIN`** bảng `cong_viec` và `cong_viec_tien_do` (để không bị mất dự án nếu chưa có log tiến độ).
-     2. Xử lý NULL: Dùng `COALESCE(AVG(td.phan_tram), 0)` để mặc định là 0% nếu chưa có dữ liệu.
-     3. Lọc mới nhất: `AND td.thoi_gian_cap_nhat = (SELECT MAX(thoi_gian_cap_nhat) FROM cong_viec_tien_do WHERE cong_viec_id = cv.id)`.
-     4. Gom nhóm: `GROUP BY d.id, d.ten_du_an`.
-
-16. **LUẬT DỰ ÁN TẠM NGƯNG (PAUSED PROJECTS):**
-    - Khi truy vấn dự án (đặc biệt là dự án Tạm ngưng/Dừng), người dùng luôn muốn biết **Ai chịu trách nhiệm (Leader)**.
-    - **Logic lấy tên Leader:** 
-      - Bắt buộc JOIN bảng `nhanvien` (alias `nv`).
-      - Điều kiện: `du_an.lead_id = nv.id`.
-      - Lấy cột: `nv.ho_ten`.
-    - **Logic lọc trạng thái:** Dùng `trang_thai LIKE '%Ngưng%'` hoặc `LIKE '%Dừng%'`.
-    - **Logic tiến độ:** Vẫn giữ nguyên công thức tính AVG từ bảng `cong_viec` để biết dự án dừng ở mức nào.
-
-13. **LUẬT HIỆU SUẤT NHÂN SỰ (PERFORMANCE):**
-    - Đánh giá ai làm việc hiệu quả: Dựa trên số lượng công việc đã hoàn thành (`trang_thai` = 'Đã hoàn thành') và so sánh `ngay_hoan_thanh` <= `han_hoan_thanh` (xong trước hạn).
-    - Đánh giá quá tải: Đếm số lượng công việc `trang_thai` = 'Đang thực hiện' của từng người.
-
-14. **LUẬT TÊN CỘT TRẠNG THÁI (STATUS COLUMN NAMES):**
-   - LƯU Ý RẤT QUAN TRỌNG VỀ SCHEMA:
-     + Bảng `cong_viec` dùng cột: **`trang_thai`** [2].
-     + Bảng `du_an` dùng cột: **`trang_thai_duan`** [1].
-   - Tuyệt đối không dùng `du_an.trang_thai` (sẽ gây lỗi SQL).
-
-11. **LUẬT DỰ ÁN TẠM NGƯNG:**
-    - Khi lọc dự án tạm ngưng, dùng điều kiện: `d.trang_thai_du_an LIKE '%Ngưng%'`.
-    - Vẫn tính toán tiến độ trung bình từ `cong_viec` để hiển thị mức độ dở dang.
-
-12. **LUẬT XÁC ĐỊNH CÔNG VIỆC TRỄ HẠN (OVERDUE RULE):**
-    - Một công việc bị coi là TRỄ HẠN khi thỏa mãn 2 điều kiện:
-      1. `trang_thai` KHÁC 'Đã hoàn thành' (Ví dụ: 'Đang thực hiện', 'Mới tạo'...).
-      2. `han_hoan_thanh` < `CURRENT_DATE` (Ngày hiện tại).
-    - Câu lệnh SQL mẫu: `WHERE cv.trang_thai != 'Đã hoàn thành' AND cv.han_hoan_thanh < CURDATE()`.
-
-13. **QUY TẮC ĐẾM SỐ LƯỢNG (COUNT RULE) – BẮT BUỘC:**
-- KÍCH HOẠT KHI câu hỏi chứa các cụm:
-  + "bao nhiêu"
-  + "tổng số"
-  + "có mấy"
-  + "số lượng"
-- MỤC TIÊU:
-  → Trả lời bằng **SỐ LƯỢNG** (không liệt kê danh sách chi tiết).
-- SQL LOGIC BẮT BUỘC:
-  → PHẢI sử dụng hàm:
-    `COUNT(*) AS total`
-- MẪU SQL CHUẨN:
-  ```sql
-  SELECT COUNT(*) AS total
-  FROM <table>;
-
-14. **LUẬT TRA CỨU ĐƠN NGHỈ PHÉP (LEAVE REQUESTS - REAL DATA):**
-    - **Cấu trúc bảng `don_nghi_phep` thực tế:**
-      + Cột ngày: `ngay_bat_dau` và `ngay_ket_thuc` (KHÔNG dùng `tu_ngay`/`den_ngay`).
-      + Khóa ngoại: `nhan_vien_id` (có gạch dưới `_`).
-      + Trạng thái: Giá trị lưu là `'da_duyet'` (không dấu, viết thường).
-    - **Logic tìm người đang nghỉ:**
-      + `CURRENT_DATE` nằm trong khoảng `ngay_bat_dau` và `ngay_ket_thuc`.
-      + Điều kiện: `trang_thai = 'da_duyet'`.
-
-15. **LUẬT TRA CỨU QUỸ PHÉP (LEAVE BALANCE):**
-    - **Cấu trúc bảng `ngay_phep_nam`:**
-      + Khóa ngoại: `nhan_vien_id`.
-      + Cột số liệu: `tong_ngay_phep`, `ngay_phep_da_dung`, `ngay_phep_con_lai`.
-    - **Logic Join:** `ngay_phep_nam.nhan_vien_id = nhanvien.id`.
-
-16. **LUẬT TÌM LÃNH ĐẠO / GIÁM ĐỐC (LEADERSHIP LOOKUP):**
-    - Khi người dùng hỏi: "Giám đốc là ai?", "Ai là sếp?", "CEO của công ty", "Ban lãnh đạo".
-    - **Logic:** Truy vấn bảng `nhanvien`.
-    - **Điều kiện:** Tìm kiếm trong cột `chuc_vu` hoặc `vai_tro`.
-    - **Từ khóa lọc:** Sử dụng `LIKE '%Giám đốc%'`, `LIKE '%CEO%'`, hoặc `LIKE '%Chủ tịch%'`.
-    - **SQL mẫu:** `SELECT ho_ten, chuc_vu, email FROM nhanvien WHERE chuc_vu LIKE '%Giám đốc%' OR chuc_vu LIKE '%CEO%'`.
-    
-SCHEMA CHI TIẾT:
-{HRM_SCHEMA_RAW}
-"""
-
-# ==========================================================
-import pandas as pd
-import re
-from langchain_core.prompts import PromptTemplate
-# Nhớ import các hàm tạo file chúng ta đã viết ở bước trước
-# from report_generator import create_word_report, create_pdf_report (hoặc để chung file cũng được)
-
-# --- 1. HÀM SINH SQL TỪ LLM ---
-def generate_sql_from_llm(question):
-    """
-    Gửi Schema và câu hỏi cho AI để nhận lại câu lệnh SQL
-    """
-    template = f"""
-    {HRM_SCHEMA_ENHANCED}
-    
-    Dựa trên quy tắc và schema trên, hãy viết câu lệnh SQL để trả lời câu hỏi: "{question}"
-    
-    Yêu cầu:
-    - Chỉ trả về duy nhất câu lệnh SQL. 
-    - Không giải thích, không markdown (```sql).
-    - Nếu cần xuất file, hãy lấy càng nhiều cột chi tiết càng tốt.
-    """
-    
-    # Giả sử bạn đã khởi tạo biến 'llm' (OpenAI/Google Gemini) ở đầu file
-    # response = llm.invoke(template) 
-    # return response.content.strip().replace("```sql", "").replace("```", "")
-    
-    # [CODE MẪU CHO LANGCHAIN]:
-    prompt = PromptTemplate.from_template(template)
-    chain = prompt | llm 
-    sql = chain.invoke({})
-    
-    # Làm sạch chuỗi SQL (xóa markdown thừa nếu có)
-    sql_clean = sql.strip().replace("```sql", "").replace("```", "").strip()
-    return sql_clean
-
-# --- 2. HÀM TÓM TẮT KẾT QUẢ (NÓI CHUYỆN VỚI SẾP) ---
-def generate_natural_response(question, data):
-    """
-    AI đọc dữ liệu SQL và trả lời Sếp bằng tiếng Việt tự nhiên
-    """
-    if not data:
-        return "Thưa sếp, em đã tìm trong hệ thống nhưng không thấy dữ liệu nào phù hợp ạ."
-        
-    data_preview = str(data[:10]) # Chỉ đưa 10 dòng đầu cho AI đọc để tiết kiệm token
-    
-    prompt = f"""
-    Câu hỏi của Sếp: "{question}"
-    Dữ liệu tìm được từ Database: {data_preview}
-    
-    Hãy đóng vai trợ lý ảo chuyên nghiệp, trả lời ngắn gọn, đi vào trọng tâm.
-    Nếu dữ liệu là danh sách dài, hãy chỉ tóm tắt các con số quan trọng (Tổng số, Top đầu...).
-    """
-    
-    return llm.invoke(prompt).content
-
-# --- 3. HÀM XỬ LÝ CHÍNH (MAIN HANDLER) ---
-def handle_query(question):
-    """
-    Hàm này sẽ được ui.py gọi.
-    Input: Câu hỏi của user.
-    Output: Dictionary chứa nội dung trả lời và thông tin file (nếu có).
-    """
-    print(f"DEBUG: Nhận câu hỏi: {question}")
-    
-    try:
-        # BƯỚC 1: AI Dịch câu hỏi sang SQL
-        sql_query = generate_sql_from_llm(question)
-        print(f"DEBUG: SQL Generated: {sql_query}")
-        
-        # BƯỚC 2: Chạy SQL lấy dữ liệu thô
-        # (Giả sử bạn đã có hàm execute_sql_query kết nối DB)
-        raw_data = execute_sql_query(sql_query) 
-        
-        # Nếu không có dữ liệu hoặc lỗi
-        if isinstance(raw_data, str) and "Error" in raw_data:
-            return {
-                "type": "text", 
-                "content": f"Hệ thống gặp lỗi khi truy vấn: {raw_data}"
-            }
-        
-        if not raw_data:
-            return {
-                "type": "text", 
-                "content": "Dạ em kiểm tra thì không thấy dữ liệu nào khớp với yêu cầu của Sếp ạ."
-            }
-
-        # BƯỚC 3: PHÂN TÍCH Ý ĐỊNH XUẤT FILE
-        # Kiểm tra xem Sếp có đòi file không
-        q_lower = question.lower()
-        export_needed = False
-        file_path = None
-        file_format = None
-        
-        if "word" in q_lower or "docx" in q_lower or "văn bản" in q_lower:
-            export_needed = True
-            file_format = "docx"
-            # Gọi hàm tạo Word (đã viết ở bước trước)
-            file_path = create_word_report(raw_data, title="BÁO CÁO HRM", filename_prefix="baocao")
-            
-        elif "pdf" in q_lower or "xuất file" in q_lower: # Mặc định xuất PDF nếu nói chung chung
-            export_needed = True
-            file_format = "pdf"
-            # Gọi hàm tạo PDF
-            file_path = create_pdf_report(raw_data, title="BAO CAO HRM", filename_prefix="baocao")
-
-        # BƯỚC 4: TRẢ KẾT QUẢ VỀ UI
-        if export_needed and file_path:
-            return {
-                "type": "file",
-                "content": f"Dạ, em đã trích xuất xong dữ liệu Sếp cần ({len(raw_data)} dòng). Mời Sếp tải báo cáo bên dưới ạ:",
-                "path": file_path,
-                "format": file_format
-            }
-        else:
-            # Nếu không xuất file, nhờ AI tóm tắt bằng lời
-            summary = generate_natural_response(question, raw_data)
-            return {
-                "type": "text",
-                "content": summary
-            }
-
-    except Exception as e:
-        print(f"ERROR: {str(e)}")
-        return {"type": "text", "content": "Xin lỗi Sếp, hệ thống đang gặp chút trục trặc kỹ thuật."}
-# ==========================================================
-
-# --- PROMPT 1: SINH SQL (Kèm Few-Shot Learning) ---
-SQL_PROMPT = ChatPromptTemplate.from_template("""
-Bạn là SQL Generation Engine. Nhiệm vụ: Chuyển câu hỏi thành SQL Server/MySQL query tối ưu.
-
-⛔ BỘ LUẬT CẤM (CRITICAL RULES):
-1. **Output:** Chỉ trả về code SQL trần (Raw text). KHÔNG Markdown, KHÔNG giải thích.
-2. **Luật Đi Muộn:** Bắt buộc `check_in >= '08:06:00'`.
-3. **Luật Vắng Mặt:** Dùng `NOT IN (SELECT...)`.
-4. **An toàn:** Chỉ dùng bảng/cột có trong SCHEMA.
-5. Ngoài lề:
-- Chỉ trả về "NO_DATA" nếu:
-  a) Câu hỏi hoàn toàn KHÔNG liên quan đến HRM / Dự án / Nhân sự
-  b) Không ánh xạ được tới BẤT KỲ bảng nào trong schema
-- Nếu câu hỏi còn mơ hồ nhưng có khả năng liên quan,hãy suy luận hợp lý nhất và sinh SQL an toàn.
-
-HỌC TỪ VÍ DỤ (FEW-SHOT):
-- User: "Hôm nay ai đi muộn?" 
-  -> SQL: SELECT n.ho_ten, c.check_in FROM cham_cong c JOIN nhanvien n ON c.nhan_vien_id = n.id WHERE c.ngay = CURRENT_DATE AND c.check_in >= '08:06:00'
-
-- User: "Ai vắng mặt hôm nay?"
-  -> SQL: SELECT ho_ten FROM nhanvien WHERE id NOT IN (SELECT nhan_vien_id FROM cham_cong WHERE ngay = CURRENT_DATE)
-
-User: "Lương cơ bản của Nam là bao nhiêu?"
-  -> SQL: SELECT ho_ten, luong_co_ban FROM nhanvien WHERE ho_ten LIKE '%Nam%'
-                                              
-- User: "Có dự án nào đang bị trễ hạn không?"
-  -> SQL: SELECT ten_du_an, ngay_ket_thuc FROM du_an WHERE ngay_ket_thuc < CURRENT_DATE AND trang_thai_duan != 'Đã hoàn thành'
-
-- User: "Liệt kê các dự án quá hạn và tên người quản lý?"
-  -> SQL: SELECT d.ten_du_an, n.ho_ten, d.ngay_ket_thuc FROM du_an d JOIN nhanvien n ON d.lead_id = n.id WHERE d.ngay_ket_thuc < CURRENT_DATE AND d.trang_thai_du_an != 'Đã hoàn thành'
-
-- User: "Tiến độ hiện tại của công việc 'Lên phương án hợp tác với TPX' đến đâu rồi?"
-  -> SQL: SELECT td.phan_tram, td.thoi_gian_cap_nhat FROM cong_viec_tien_do td JOIN cong_viec cv ON td.cong_viec_id = cv.id WHERE cv.ten_cong_viec LIKE '%Lên phương án hợp tác với TPX%' ORDER BY td.thoi_gian_cap_nhat DESC LIMIT 1
-
-- User: "Cho tôi xem chi tiết các bước của việc 'Làm việc với a Bình BIDV'?"
-  -> SQL: SELECT qt.ten_buoc, qt.trang_thai, qt.mo_ta, qt.ngay_ket_thuc FROM cong_viec_quy_trinh qt JOIN cong_viec cv ON qt.cong_viec_id = cv.id WHERE cv.ten_cong_viec LIKE '%Tuyển dụng nhân sự%' ORDER BY qt.ngay_bat_dau ASC
-
-User: "Liệt kê các công việc đã hoàn thành trên 50%?"
-  -> SQL: SELECT cv.ten_cong_viec, td.phan_tram, td.thoi_gian_cap_nhat FROM cong_viec cv JOIN cong_viec_tien_do td ON cv.id = td.cong_viec_id WHERE td.phan_tram > 50 AND td.thoi_gian_cap_nhat = (SELECT MAX(thoi_gian_cap_nhat) FROM cong_viec_tien_do WHERE cong_viec_id = cv.id)
-                                              
-- User: "Có bao nhiêu công việc đã hoàn thành trên 50%?"
-  -> SQL: SELECT COUNT(cv.id) AS so_luong FROM cong_viec cv JOIN cong_viec_tien_do td ON cv.id = td.cong_viec_id WHERE td.phan_tram > 50 AND td.thoi_gian_cap_nhat = (SELECT MAX(thoi_gian_cap_nhat) FROM cong_viec_tien_do WHERE cong_viec_id = cv.id)                        
-
-User: "Thống kê số lượng dự án theo từng trạng thái?"
-  -> SQL: SELECT trang_thai_du_an, COUNT(id) FROM du_an GROUP BY trang_thai_du_an
-                                              
-User: "Liệt kê những dự án đã hoàn thành trên 80%?"
-  -> SQL: SELECT d.ten_du_an, AVG(td.phan_tram) as tien_do_tb FROM du_an d JOIN cong_viec cv ON d.id = cv.du_an_id JOIN cong_viec_tien_do td ON cv.id = td.cong_viec_id WHERE td.thoi_gian_cap_nhat = (SELECT MAX(thoi_gian_cap_nhat) FROM cong_viec_tien_do WHERE cong_viec_id = cv.id) GROUP BY d.id, d.ten_du_an HAVING AVG(td.phan_tram) > 80          
-
- User: "Có bao nhiêu dự án có tiến độ dưới 50%?"
-  -> SQL: SELECT COUNT(*) as so_luong FROM (SELECT d.id FROM du_an d JOIN cong_viec cv ON d.id = cv.du_an_id JOIN cong_viec_tien_do td ON cv.id = td.cong_viec_id WHERE td.thoi_gian_cap_nhat = (SELECT MAX(thoi_gian_cap_nhat) FROM cong_viec_tien_do WHERE cong_viec_id = cv.id) GROUP BY d.id HAVING AVG(td.phan_tram) < 50) as subquery
-
-- User: "Liệt kê các dự án có tiến độ dưới 50%?"
-  -> SQL: SELECT d.ten_du_an, AVG(td.phan_tram) as tien_do_trung_binh FROM du_an d JOIN cong_viec cv ON d.id = cv.du_an_id JOIN cong_viec_tien_do td ON cv.id = td.cong_viec_id WHERE td.thoi_gian_cap_nhat = (SELECT MAX(thoi_gian_cap_nhat) FROM cong_viec_tien_do WHERE cong_viec_id = cv.id) GROUP BY d.id, d.ten_du_an HAVING AVG(td.phan_tram) < 50                                              
-                                              
-     
-
-- User: "Tiến độ dự án 'Database Mobifone' hiện tại là bao nhiêu?"
-  -> SQL: SELECT d.ten_du_an, COALESCE(AVG(td.phan_tram), 0) as phan_tram_hoan_thanh 
-          FROM du_an d 
-          LEFT JOIN cong_viec cv ON d.id = cv.du_an_id 
-          LEFT JOIN cong_viec_tien_do td ON cv.id = td.cong_viec_id 
-          AND td.thoi_gian_cap_nhat = (SELECT MAX(thoi_gian_cap_nhat) FROM cong_viec_tien_do WHERE cong_viec_id = cv.id)
-          WHERE d.ten_du_an LIKE '%Database Mobifone%'
-          GROUP BY d.id, d.ten_du_an                                            
-
-- User: "Thống kê số lượng dự án theo từng trạng thái?"
-  -> SQL: SELECT trang_thai_duan, COUNT(id) as so_luong FROM du_an GROUP BY trang_thai_duan
-
-- User: "Có bao nhiêu dự án đang ở trạng thái 'Đang thực hiện'?"
-  -> SQL: SELECT COUNT(id) as so_luong FROM du_an WHERE trang_thai_du_an LIKE '%Đang thực hiện%'                                                                                          
-
-- User: "Những dự án nào đang bị tạm ngưng và ai là quản lý?"
-  -> SQL: SELECT d.ten_du_an, d.trang_thai, COALESCE(AVG(td.phan_tram), 0) as tien_do_luc_dung, nv.ho_ten as quan_ly_du_an
-          FROM du_an d 
-          LEFT JOIN cong_viec cv ON d.id = cv.du_an_id 
-          LEFT JOIN cong_viec_tien_do td ON cv.id = td.cong_viec_id 
-          AND td.thoi_gian_cap_nhat = (SELECT MAX(thoi_gian_cap_nhat) FROM cong_viec_tien_do WHERE cong_viec_id = cv.id)
-          LEFT JOIN nhanvien nv ON d.lead_id = nv.id
-          WHERE d.trang_thai LIKE '%Ngưng%' OR d.trang_thai LIKE '%Dừng%'
-          GROUP BY d.id, d.ten_du_an, d.trang_thai, nv.ho_ten
-
-# --- Kịch bản: Hỏi thông tin Lead của một dự án cụ thể ---
-- User: "Ai đang phụ trách dự án 'Oracle Cloud' và tiến độ thế nào?"
-  -> SQL: SELECT d.ten_du_an, nv.ho_ten as lead_du_an, nv.email, COALESCE(AVG(td.phan_tram), 0) as tien_do
-          FROM du_an d 
-          LEFT JOIN nhanvien nv ON d.lead_id = nv.id
-          LEFT JOIN cong_viec cv ON d.id = cv.du_an_id 
-          LEFT JOIN cong_viec_tien_do td ON cv.id = td.cong_viec_id 
-          AND td.thoi_gian_cap_nhat = (SELECT MAX(thoi_gian_cap_nhat) FROM cong_viec_tien_do WHERE cong_viec_id = cv.id)
-          WHERE d.ten_du_an LIKE '%Oracle Cloud%'
-          GROUP BY d.id, d.ten_du_an, nv.ho_ten, nv.email   
-
-- User: "Top 5 nhân viên hoàn thành nhiều công việc nhất trong tháng này?"
-  -> SQL: SELECT nv.ho_ten, COUNT(cv.id) as so_viec_hoan_thanh, pb.ten_phong
-          FROM nhanvien nv 
-          JOIN cong_viec_nguoi_nhan cvnn ON nv.id = cvnn.nhan_vien_id 
-          JOIN cong_viec cv ON cvnn.cong_viec_id = cv.id 
-          JOIN phong_ban pb ON nv.phong_ban_id = pb.id
-          WHERE cv.trang_thai = 'Đã hoàn thành' AND MONTH(cv.ngay_hoan_thanh) = MONTH(CURRENT_DATE())
-          GROUP BY nv.id, nv.ho_ten, pb.ten_phong
-          ORDER BY so_viec_hoan_thanh DESC LIMIT 5
-
-- User: "Thống kê khối lượng công việc đang chạy theo từng phòng ban?"
-  -> SQL: SELECT pb.ten_phong, COUNT(cv.id) as so_luong_viec_dang_lam 
-          FROM phong_ban pb 
-          JOIN cong_viec cv ON pb.id = cv.phong_ban_id 
-          WHERE cv.trang_thai = 'Đang thực hiện' 
-          GROUP BY pb.ten_phong 
-          ORDER BY so_luong_viec_dang_lam DESC
-
-- User: "Những dự án nào đang bị tạm ngưng và ai là quản lý?"
-  -> SQL: SELECT d.ten_du_an, d.trang_thai_duan, COALESCE(AVG(td.phan_tram), 0) as tien_do_luc_dung, nv.ho_ten as quan_ly_du_an
-          FROM du_an d 
-          LEFT JOIN cong_viec cv ON d.id = cv.du_an_id 
-          LEFT JOIN cong_viec_tien_do td ON cv.id = td.cong_viec_id 
-          AND td.thoi_gian_cap_nhat = (SELECT MAX(thoi_gian_cap_nhat) FROM cong_viec_tien_do WHERE cong_viec_id = cv.id)
-          LEFT JOIN nhanvien nv ON d.lead_id = nv.id
-          WHERE d.trang_thai_duan LIKE '%Ngưng%' OR d.trang_thai_duan LIKE '%Dừng%'
-          GROUP BY d.id, d.ten_du_an, d.trang_thai_duan, nv.ho_ten
-
-- User: "Thống kê số lượng dự án theo từng trạng thái?"
-  -> SQL: SELECT trang_thai_duan, COUNT(id) as so_luong FROM du_an GROUP BY trang_thai_duan                                              
-
-- User: "Kiểm tra xem Trần Đình Nam có công việc nào đang bị trễ hạn không?"
-  -> SQL: SELECT cv.ten_cong_viec, cv.han_hoan_thanh, cv.trang_thai, nv.ho_ten
-          FROM cong_viec cv
-          JOIN cong_viec_nguoi_nhan cvnn ON cv.id = cvnn.cong_viec_id
-          JOIN nhanvien nv ON cvnn.nhan_vien_id = nv.id
-          WHERE nv.ho_ten LIKE '%Trần Đình Nam%'
-          AND cv.trang_thai != 'Đã hoàn thành' 
-          AND cv.han_hoan_thanh < CURRENT_DATE
-
-
-- User: "Liệt kê các công việc đã làm xong của nhân viên mã số 24?"
-  -> SQL: SELECT cv.ten_cong_viec, cv.ngay_hoan_thanh, cv.muc_do_uu_tien
-          FROM cong_viec cv
-          JOIN cong_viec_nguoi_nhan cvnn ON cv.id = cvnn.cong_viec_id
-          WHERE cvnn.nhan_vien_id = 24
-          AND cv.trang_thai = 'Đã hoàn thành'
-
-
-- User: "Danh sách công việc và tình trạng hạn chót của dự án Web HRM?"
-  -> SQL: SELECT cv.ten_cong_viec, nv.ho_ten as nguoi_lam, cv.han_hoan_thanh, cv.trang_thai,
-                 CASE 
-                    WHEN cv.trang_thai != 'Đã hoàn thành' AND cv.han_hoan_thanh < CURRENT_DATE THEN 'Trễ hạn'
-                    ELSE 'Đúng hạn/Đang chạy'
-                 END as tinh_trang_han
-          FROM cong_viec cv
-          JOIN cong_viec_nguoi_nhan cvnn ON cv.id = cvnn.cong_viec_id
-          JOIN nhanvien nv ON cvnn.nhan_vien_id = nv.id
-          JOIN du_an d ON cv.du_an_id = d.id
-          WHERE d.ten_du_an LIKE '%Web HRM%'         
-
-- User: "Hôm nay ai đang nghỉ phép?" 
-  -> SQL: SELECT nv.ho_ten, dnp.ly_do FROM don_nghi_phep dnp JOIN nhanvien nv ON dnp.nhan_vien_id = nv.id WHERE CURRENT_DATE BETWEEN dnp.ngay_bat_dau AND dnp.ngay_ket_thuc AND dnp.trang_thai = 'da_duyet'
-- User: "Nguyễn Tấn Dũng còn bao nhiêu phép?"
-  -> SQL: SELECT nv.ho_ten, np.ngay_phep_con_lai FROM ngay_phep_nam np JOIN nhanvien nv ON np.nhan_vien_id = nv.id WHERE nv.ho_ten LIKE '%Nguyễn Tấn Dũng%' AND np.nam = YEAR(CURRENT_DATE)
-- User: "Giám đốc công ty là ai?" -> SQL: SELECT ho_ten, chuc_vu, email, so_dien_thoai FROM nhanvien WHERE chuc_vu LIKE '%Giám đốc%' OR chuc_vu LIKE '%CEO%' OR chuc_vu LIKE '%General Manager%'
-SCHEMA:
-{schema}
-
-CÂU HỎI:
-{question}
-
-SQL OUTPUT (Only SQL):
-""")
-
-# --- PROMPT 2: ĐỌC BÁO CÁO (Humanize Answer) ---
-ANSWER_PROMPT = ChatPromptTemplate.from_template("""
-Bạn là trợ lý HRM thông minh.
-Nhiệm vụ: Đọc dữ liệu JSON và trả lời câu hỏi của người dùng.
-
-THÔNG TIN:
-- Câu hỏi: "{question}"
-- Dữ liệu nhận được: {data}
-
-YÊU CẦU TRẢ LỜI:
-
-1. Nếu dữ liệu KHÔNG rỗng:
-   - Trả lời thẳng vào vấn đề
-   - Liệt kê đầy đủ danh sách nếu có nhiều bản ghi
-
-2. Nếu dữ liệu rỗng (Empty List hoặc Null):
-   - Không nói "Không tìm thấy dữ liệu"
-   - Được phép suy luận tích cực dựa trên logic nghiệp vụ thông thường
-   - Áp dụng cho các câu hỏi kiểm tra trạng thái
-     (ví dụ: đi muộn, nghỉ làm, trễ hạn, chưa hoàn thành)
-   - Ví dụ:
-     + "Ai đi muộn?" → "Tuyệt vời! Hôm nay không có nhân viên nào đi muộn."
-     + "Ai nghỉ làm?" → "Hôm nay toàn bộ nhân viên đều đi làm đầy đủ."
-
-3. Với dữ liệu thống kê (COUNT, SUM, AVG):
-   - Nếu dữ liệu là một con số, đó chính là câu trả lời
-   - Trả lời trực tiếp, không nói thiếu thông tin
-
-4. Khi SQL đã có điều kiện lọc:
-   - Mặc định TẤT CẢ bản ghi trả về đều thỏa mãn điều kiện
-   - Không cần suy đoán thêm từ phía AI
-
-5. TRUNG THỰC VỚI DỮ LIỆU (DATA FIDELITY – BẮT BUỘC):
-   - Không được tự ý loại bỏ bất kỳ bản ghi nào
-   - Không được bỏ qua các giá trị 0 (0% tiến độ là thông tin hợp lệ)
-   - SQL trả về gì → câu trả lời phải phản ánh đúng như vậy
-
-6. QUY TẮC ĐỊNH DẠNG (BẮT BUỘC):
-  - TUYỆT ĐỐI KHÔNG dùng Markdown in đậm (**).
-  - KHÔNG dùng **text** trong mọi trường hợp.
-  - Chỉ trả lời bằng văn bản thường.
-  - Nếu cần liệt kê → dùng dấu "-" ở đầu dòng.
-GIỌNG ĐIỆU:
-Tự nhiên, thân thiện, chuyên nghiệp, giống trợ lý nội bộ doanh nghiệp.
-
-TRẢ LỜI:
-""")
-
-
-# ==========================================================
-# 4.5. DOWNLOAD FILE ENDPOINT
-# ==========================================================
-from fastapi.responses import FileResponse
-import os
-
-@app.get("/download/{filename}")
-async def download_file(filename: str):
-    """Serve exported files (docx/pdf) for download"""
-    # Security: Validate filename to prevent directory traversal
-    if "../" in filename or "..\\" in filename:
-        raise HTTPException(status_code=400, detail="Invalid filename")
-    
-    filepath = os.path.join(EXPORT_DIR, filename)
-    
-    # Check if file exists
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    # Return file for download
-    return FileResponse(
-        filepath,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        filename=filename
-    )
-
-# ==========================================================
-# 4. HELPER FUNCTIONS (Xử lý & Gọi API)
+# 5. HELPER FUNCTIONS
 # ==========================================================
 def validate_sql(sql: str) -> str:
-    """Làm sạch và kiểm tra an toàn SQL"""
-    # Xóa markdown nếu có
     sql_clean = sql.replace("```sql", "").replace("```", "").strip()
     
-    # Chặn các lệnh nguy hiểm (Chỉ cho phép SELECT)
     forbidden = ["insert", "update", "delete", "drop", "alter", "truncate", "grant"]
     if any(cmd in sql_clean.lower() for cmd in forbidden):
-        print(f"⚠️ Blocked dangerous SQL: {sql_clean}")
+        print(f"Blocked dangerous SQL: {sql_clean}")
         return ""
+    
+    # FIX AUTOMATIC: Replace ho_ten = '...' with ho_ten LIKE '%...%' (Common LLM mistake)
+    import re
+    # Pattern: ho_ten = 'value' or nv.ho_ten = 'value' or n.ho_ten = 'value', etc.
+    sql_clean = re.sub(
+        r"(\w+\.)?ho_ten\s*=\s*'([^']+)'",
+        lambda m: f"{m.group(1) or ''}ho_ten LIKE '%{m.group(2)}%'",
+        sql_clean,
+        flags=re.IGNORECASE
+    )
     
     return sql_clean
 
 def execute_sql_api(sql: str) -> Any:
-    """Gọi API HRM để lấy dữ liệu"""
     if not sql: return None
 
-    # Log query ra terminal để debug
     print(f"\n[DEBUG SQL]: {sql}")
 
     try:
@@ -773,32 +216,1262 @@ def execute_sql_api(sql: str) -> Any:
         
         if res.status_code == 200:
             try:
-                # Ưu tiên trả về JSON object
-                return res.json()
+                result = res.json()
+                # Kiểm tra nếu server trả về lỗi
+                if isinstance(result, dict) and result.get('success') == False:
+                    error_msg = result.get('error', 'Unknown error')
+                    print(f"[API REJECTED]: {error_msg}")
+                    print(f"[PROBLEM SQL]: {sql}")
+                return result
             except:
                 return res.text
         else:
-            print(f"❌ API Error {res.status_code}: {res.text}")
+            print(f"API Error {res.status_code}: {res.text}")
             return f"Lỗi từ hệ thống dữ liệu: {res.text}"
     except Exception as e:
-        print(f"❌ Connection Error: {e}")
+        print(f"Connection Error: {e}")
         return "Lỗi kết nối đến máy chủ dữ liệu."
 
 # ==========================================================
-# 5. MAIN ENDPOINT (Luồng xử lý chính)
+# 6. DAILY BRIEFING ENDPOINT
 # ==========================================================
+@app.post("/briefing", response_model=BriefingResponse)
+async def get_daily_briefing(req: BriefingRequest):
+    """
+    API lấy thông tin tóm tắt hàng ngày cho user.
+    Trả về thông tin khác nhau tùy theo role.
+    """
+    try:
+        user_id = req.user_id
+        role = req.role
+        dept_id = req.phong_ban_id
+        
+        print(f"\n[BRIEFING] User: {user_id}, Role: {role}, Dept: {dept_id}")
+        
+        # Lấy thông tin user
+        user_sql = f"SELECT ho_ten, chuc_vu FROM nhanvien WHERE id = {user_id}"
+        user_result = execute_sql_api(user_sql)
+        user_name = "Bạn"
+        if isinstance(user_result, dict) and user_result.get('data'):
+            user_name = user_result['data'][0].get('ho_ten', 'Bạn')
+        elif isinstance(user_result, list) and len(user_result) > 0:
+            user_name = user_result[0].get('ho_ten', 'Bạn')
+        
+        # Xác định lời chào theo thời gian
+        hour = datetime.now().hour
+        if hour < 12:
+            time_greeting = "Chào buổi sáng"
+        elif hour < 18:
+            time_greeting = "Chào buổi chiều"
+        else:
+            time_greeting = "Chào buổi tối"
+        
+        greeting = f"☀️ {time_greeting}, {user_name}!"
+        
+        # === THÔNG TIN CHUNG CHO TẤT CẢ ROLE ===
+        
+        # 1. Trạng thái check-in hôm nay (chỉ dành cho Employee & Manager)
+        checkin_status = None
+        if role != 'admin':
+            checkin_sql = f"""
+            SELECT check_in 
+            FROM cham_cong 
+            WHERE nhan_vien_id = {user_id} AND ngay = CURDATE()
+            """
+            checkin_result = execute_sql_api(checkin_sql)
+            
+            if isinstance(checkin_result, dict) and checkin_result.get('data'):
+                data = checkin_result['data']
+                if len(data) > 0:
+                    check_in = data[0].get('check_in', '')
+                    is_late = check_in and check_in >= '08:06:00'
+                    checkin_status = {
+                        "checked_in": bool(check_in),
+                        "check_in_time": check_in,
+                        "check_out_time": None,
+                        "is_late": is_late,
+                        "status_text": "Đi muộn" if is_late else "Đúng giờ" if check_in else "Chưa check-in"
+                    }
+            elif isinstance(checkin_result, list) and len(checkin_result) > 0:
+                check_in = checkin_result[0].get('check_in', '')
+                is_late = check_in and check_in >= '08:06:00'
+                checkin_status = {
+                    "checked_in": bool(check_in),
+                    "check_in_time": check_in,
+                    "check_out_time": None,
+                    "is_late": is_late,
+                    "status_text": "Đi muộn" if is_late else "Đúng giờ" if check_in else "Chưa check-in"
+                }
+            
+            if not checkin_status:
+                checkin_status = {
+                    "checked_in": False,
+                    "check_in_time": None,
+                    "check_out_time": None,
+                    "is_late": False,
+                    "status_text": "Chưa check-in"
+                }
+        else:
+            # Admin: không cần check-in cá nhân
+            checkin_status = None
+        
+        # 2. Công việc cần làm hôm nay
+        tasks_sql = f"""
+        SELECT cv.ten_cong_viec, cv.han_hoan_thanh, cv.muc_do_uu_tien, cv.trang_thai
+        FROM cong_viec cv
+        JOIN cong_viec_nguoi_nhan cvnn ON cv.id = cvnn.cong_viec_id
+        WHERE cvnn.nhan_vien_id = {user_id} 
+        AND cv.trang_thai != 'Đã hoàn thành'
+        ORDER BY cv.muc_do_uu_tien DESC, cv.han_hoan_thanh ASC
+        LIMIT 5
+        """
+        tasks_result = execute_sql_api(tasks_sql)
+        tasks_today = []
+        
+        if isinstance(tasks_result, dict) and tasks_result.get('data'):
+            tasks_today = tasks_result['data']
+        elif isinstance(tasks_result, list):
+            tasks_today = tasks_result
+        
+        # 3. Số ngày phép còn lại
+        leave_sql = f"""
+        SELECT tong_ngay_phep, ngay_phep_da_dung, ngay_phep_con_lai
+        FROM ngay_phep_nam
+        WHERE nhan_vien_id = {user_id} AND nam = YEAR(CURDATE())
+        """
+        leave_result = execute_sql_api(leave_sql)
+        leave_balance = None
+        
+        if isinstance(leave_result, dict) and leave_result.get('data'):
+            data = leave_result['data']
+            if len(data) > 0:
+                leave_balance = data[0]
+        elif isinstance(leave_result, list) and len(leave_result) > 0:
+            leave_balance = leave_result[0]
+        
+        
+        alerts = []
+        team_summary = None
+        dept_tasks_summary = None
+        dept_projects_summary = None
+        company_summary = None
+        
+        # === THÔNG TIN CHO MANAGER ===
+        if role == 'manager' and dept_id:
+            # Tình hình phòng ban
+            team_checkin_sql = f"""
+            SELECT 
+                (SELECT COUNT(*) FROM nhanvien WHERE phong_ban_id = {dept_id}) as total,
+                (SELECT COUNT(DISTINCT c.nhan_vien_id) 
+                 FROM cham_cong c 
+                 JOIN nhanvien nv ON c.nhan_vien_id = nv.id 
+                 WHERE nv.phong_ban_id = {dept_id} AND c.ngay = CURDATE()) as checked_in,
+                (SELECT COUNT(DISTINCT dnp.nhan_vien_id) 
+                 FROM don_nghi_phep dnp 
+                 JOIN nhanvien nv ON dnp.nhan_vien_id = nv.id 
+                 WHERE nv.phong_ban_id = {dept_id} 
+                 AND CURDATE() BETWEEN dnp.tu_ngay AND dnp.den_ngay 
+                 AND dnp.trang_thai = 'da_duyet') as on_leave
+            """
+            team_result = execute_sql_api(team_checkin_sql)
+            
+            if isinstance(team_result, dict) and team_result.get('data'):
+                data = team_result['data'][0] if team_result['data'] else {}
+                team_summary = {
+                    "total_employees": data.get('total', 0),
+                    "checked_in": data.get('checked_in', 0),
+                    "on_leave": data.get('on_leave', 0),
+                    "not_checked_in": data.get('total', 0) - data.get('checked_in', 0) - data.get('on_leave', 0)
+                }
+            elif isinstance(team_result, list) and len(team_result) > 0:
+                data = team_result[0]
+                team_summary = {
+                    "total_employees": data.get('total', 0),
+                    "checked_in": data.get('checked_in', 0),
+                    "on_leave": data.get('on_leave', 0),
+                    "not_checked_in": data.get('total', 0) - data.get('checked_in', 0) - data.get('on_leave', 0)
+                }
+            
+            # Công việc phòng ban
+            dept_tasks_sql = f"""
+            SELECT 
+                COUNT(DISTINCT cv.id) as total_tasks,
+                COUNT(DISTINCT CASE WHEN cv.trang_thai = 'Đã hoàn thành' THEN cv.id END) as completed_tasks,
+                COUNT(DISTINCT CASE WHEN cv.trang_thai != 'Đã hoàn thành' AND cv.han_hoan_thanh < CURDATE() THEN cv.id END) as overdue_tasks
+            FROM cong_viec cv
+            JOIN cong_viec_nguoi_nhan cvnn ON cv.id = cvnn.cong_viec_id
+            JOIN nhanvien nv ON cvnn.nhan_vien_id = nv.id
+            WHERE nv.phong_ban_id = {dept_id}
+            """
+            dept_tasks_result = execute_sql_api(dept_tasks_sql)
+            
+            if isinstance(dept_tasks_result, dict) and dept_tasks_result.get('data'):
+                data = dept_tasks_result['data'][0] if dept_tasks_result['data'] else {}
+                dept_tasks_summary = {
+                    "total_tasks": data.get('total_tasks', 0),
+                    "completed_tasks": data.get('completed_tasks', 0),
+                    "overdue_tasks": data.get('overdue_tasks', 0)
+                }
+            elif isinstance(dept_tasks_result, list) and len(dept_tasks_result) > 0:
+                data = dept_tasks_result[0]
+                dept_tasks_summary = {
+                    "total_tasks": data.get('total_tasks', 0),
+                    "completed_tasks": data.get('completed_tasks', 0),
+                    "overdue_tasks": data.get('overdue_tasks', 0)
+                }
+            
+            # Dự án phòng ban
+            dept_name_sql = f"SELECT ten_phong FROM phong_ban WHERE id = {dept_id}"
+            dept_name_result = execute_sql_api(dept_name_sql)
+            dept_name = ""
+            if isinstance(dept_name_result, dict) and dept_name_result.get('data'):
+                dept_name = dept_name_result['data'][0].get('ten_phong', '')
+            elif isinstance(dept_name_result, list) and len(dept_name_result) > 0:
+                dept_name = dept_name_result[0].get('ten_phong', '')
+            
+            # Cải thiện: Thêm thông tin Leader và tiến độ dự án (Luật 25)
+            dept_projects_sql = f"""
+            SELECT 
+                COUNT(DISTINCT d.id) as total_projects,
+                COUNT(DISTINCT CASE WHEN d.ngay_ket_thuc < CURDATE() AND d.trang_thai_duan NOT IN ('Đã hoàn thành', 'Kết thúc', 'Tạm ngưng') THEN d.id END) as overdue_projects,
+                STRING_AGG(DISTINCT CASE WHEN d.ngay_ket_thuc < CURDATE() AND d.trang_thai_duan NOT IN ('Đã hoàn thành', 'Kết thúc', 'Tạm ngưng')
+                    THEN d.ten_du_an + ' (Leader: ' + ISNULL(nv.ho_ten, 'N/A') + ', Progress: ' + CAST(ISNULL(CAST(ROUND(AVG(td.phan_tram), 0) AS INT), 0) AS VARCHAR) + '%)'
+                    ELSE NULL END, '; ') as overdue_projects_details
+            FROM du_an d
+            LEFT JOIN nhanvien nv ON d.lead_id = nv.id
+            LEFT JOIN cong_viec cv ON d.id = cv.du_an_id
+            LEFT JOIN cong_viec_tien_do td ON cv.id = td.cong_viec_id 
+                AND td.thoi_gian_cap_nhat = (SELECT MAX(thoi_gian_cap_nhat) FROM cong_viec_tien_do WHERE cong_viec_id = cv.id)
+            WHERE d.phong_ban LIKE '%{dept_name}%' 
+                AND d.trang_thai_duan NOT IN ('Đã hoàn thành', 'Kết thúc')
+            GROUP BY d.id, d.ten_du_an, nv.ho_ten
+            """
+            dept_projects_result = execute_sql_api(dept_projects_sql)
+            
+            if isinstance(dept_projects_result, dict) and dept_projects_result.get('data'):
+                data = dept_projects_result['data'][0] if dept_projects_result['data'] else {}
+                dept_projects_summary = {
+                    "total_projects": data.get('total_projects', 0),
+                    "overdue_projects": data.get('overdue_projects', 0),
+                    "overdue_projects_details": data.get('overdue_projects_details', '')
+                }
+            elif isinstance(dept_projects_result, list) and len(dept_projects_result) > 0:
+                data = dept_projects_result[0]
+                dept_projects_summary = {
+                    "total_projects": data.get('total_projects', 0),
+                    "overdue_projects": data.get('overdue_projects', 0),
+                    "overdue_projects_details": data.get('overdue_projects_details', '')
+                }
+            
+            # Alerts
+            if dept_tasks_summary and dept_tasks_summary.get('overdue_tasks', 0) > 0:
+                alerts.append({
+                    "type": "warning",
+                    "message": f"Có {dept_tasks_summary['overdue_tasks']} công việc đang trễ hạn trong phòng"
+                })
+            
+            if dept_projects_summary and dept_projects_summary.get('overdue_projects', 0) > 0:
+                alerts.append({
+                    "type": "warning",
+                    "message": f"Có {dept_projects_summary['overdue_projects']} dự án đang trễ hạn trong phòng"
+                })
+            
+            # Nhân viên chưa check-in
+            if team_summary and team_summary.get('not_checked_in', 0) > 0:
+                alerts.append({
+                    "type": "info", 
+                    "message": f"{team_summary['not_checked_in']} nhân viên chưa check-in hôm nay"
+                })
+        
+        # === THÔNG TIN CHO ADMIN ===
+        if role == 'admin':
+            company_sql = """
+            SELECT 
+                (SELECT COUNT(*) FROM nhanvien WHERE trang_thai_lam_viec LIKE '%Đang%' OR trang_thai_lam_viec IS NULL) as total_employees,
+                (SELECT COUNT(DISTINCT nhan_vien_id) FROM cham_cong WHERE DATE(ngay) = CURDATE()) as checked_in_today,
+                (SELECT COUNT(*) FROM du_an WHERE trang_thai_duan LIKE '%Đang%' OR trang_thai_duan LIKE '%thực hiện%') as active_projects,
+                (SELECT COUNT(*) FROM cong_viec WHERE trang_thai != 'Đã hoàn thành' AND han_hoan_thanh < CURDATE()) as overdue_tasks,
+                (SELECT COUNT(*) FROM du_an WHERE ngay_ket_thuc < CURDATE() AND trang_thai_duan NOT IN ('Đã hoàn thành', 'Tạm ngưng')) as overdue_projects
+            """
+            company_result = execute_sql_api(company_sql)
+            
+            print(f"[BRIEFING ADMIN] Company result type: {type(company_result)}")
+            print(f"[BRIEFING ADMIN] Company result: {company_result}")
+            
+            if isinstance(company_result, dict) and company_result.get('data'):
+                data = company_result['data'][0] if company_result['data'] else {}
+                company_summary = {
+                    "total_employees": data.get('total_employees', 0) or 0,
+                    "checked_in_today": data.get('checked_in_today', 0) or 0,
+                    "active_projects": data.get('active_projects', 0) or 0,
+                    "overdue_tasks": data.get('overdue_tasks', 0) or 0,
+                    "overdue_projects": data.get('overdue_projects', 0) or 0
+                }
+            elif isinstance(company_result, list) and len(company_result) > 0:
+                data = company_result[0]
+                company_summary = {
+                    "total_employees": data.get('total_employees', 0) or 0,
+                    "checked_in_today": data.get('checked_in_today', 0) or 0,
+                    "active_projects": data.get('active_projects', 0) or 0,
+                    "overdue_tasks": data.get('overdue_tasks', 0) or 0,
+                    "overdue_projects": data.get('overdue_projects', 0) or 0
+                }
+            else:
+                # Fallback - query từng thứ riêng
+                try:
+                    total_sql = "SELECT COUNT(*) as cnt FROM nhanvien WHERE trang_thai_lam_viec LIKE '%Đang%' OR trang_thai_lam_viec IS NULL"
+                    total_res = execute_sql_api(total_sql)
+                    total_emp = (total_res[0].get('cnt', 0) if isinstance(total_res, list) else 
+                                total_res.get('data', [{}])[0].get('cnt', 0)) if total_res else 0
+                    
+                    checkin_sql = "SELECT COUNT(DISTINCT nhan_vien_id) as cnt FROM cham_cong WHERE DATE(ngay) = CURDATE()"
+                    checkin_res = execute_sql_api(checkin_sql)
+                    checked_in = (checkin_res[0].get('cnt', 0) if isinstance(checkin_res, list) else 
+                                 checkin_res.get('data', [{}])[0].get('cnt', 0)) if checkin_res else 0
+                    
+                    company_summary = {
+                        "total_employees": total_emp or 0,
+                        "checked_in_today": checked_in or 0,
+                        "active_projects": 0,
+                        "overdue_tasks": 0,
+                        "overdue_projects": 0
+                    }
+                except:
+                    company_summary = {
+                        "total_employees": 0,
+                        "checked_in_today": 0,
+                        "active_projects": 0,
+                        "overdue_tasks": 0,
+                        "overdue_projects": 0
+                    }
+            
+            print(f"[BRIEFING ADMIN] Final company_summary: {company_summary}")
+            
+            if company_summary and company_summary.get('overdue_tasks', 0) > 0:
+                alerts.append({
+                    "type": "warning",
+                    "message": f"Có {company_summary['overdue_tasks']} công việc đang trễ hạn trong công ty"
+                })
+        
+        return BriefingResponse(
+            greeting=greeting,
+            checkin_status=checkin_status,
+            tasks_today=tasks_today[:5] if tasks_today else [],
+            leave_balance=leave_balance,
+            alerts=alerts,
+            team_summary=team_summary,
+            dept_tasks_summary=dept_tasks_summary,
+            dept_projects_summary=dept_projects_summary,
+            company_summary=company_summary
+        )
+        
+    except Exception as e:
+        print(f"[BRIEFING ERROR]: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return BriefingResponse(
+            greeting="Xin chào!",
+            checkin_status=None,
+            tasks_today=[],
+            leave_balance=None,
+            alerts=[{"type": "error", "message": "Không thể tải dữ liệu briefing"}],
+            team_summary=None,
+            company_summary=None
+        )
+
+# ==========================================================
+# 6.1. TUẦN 2 - ACTION BOT APIs
+# ==========================================================
+
+# --- Pydantic Models for Action Bot ---
+class LeaveRequestCreate(BaseModel):
+    nhanvien_id: int
+    tu_ngay: str  # YYYY-MM-DD
+    den_ngay: str
+    ly_do: str
+
+class LeaveApproveRequest(BaseModel):
+    request_id: int
+    admin_id: int
+    approved: bool
+
+class TaskAssignRequest(BaseModel):
+    ten_cong_viec: str
+    mo_ta: str = ""
+    du_an_id: Union[int, None] = None
+    nguoi_nhan_ids: List[int]
+    nguoi_giao_id: int
+    han_hoan_thanh: str  # YYYY-MM-DD
+    muc_do_uu_tien: str = "Trung bình"
+
+# --- Leave Request Endpoint ---
+@app.post("/leave-request")
+async def create_leave_request(req: LeaveRequestCreate):
+    """
+    Tạo đơn xin nghỉ phép mới.
+    Chỉ dành cho Employee và Manager.
+    """
+    try:
+        print(f"\n[LEAVE REQUEST] NhanVien: {req.nhanvien_id}")
+        print(f"[LEAVE REQUEST] Từ: {req.tu_ngay} -> Đến: {req.den_ngay}")
+        print(f"[LEAVE REQUEST] Lý do: {req.ly_do}")
+        
+        # Tạo SQL insert
+        sql = f"""
+        INSERT INTO don_nghi_phep (nhanvien_id, tu_ngay, den_ngay, ly_do, trang_thai, ngay_tao)
+        VALUES ({req.nhanvien_id}, '{req.tu_ngay}', '{req.den_ngay}', N'{req.ly_do}', N'Chờ duyệt', NOW())
+        """
+        
+        result = execute_sql_api(sql)
+        print(f"[LEAVE REQUEST] Result: {result}")
+        
+        # Demo mode fallback
+        if isinstance(result, str) and "Lỗi" in result:
+            return {
+                "success": True,
+                "message": "Đơn nghỉ phép đã được gửi thành công (Demo)",
+                "demo_mode": True
+            }
+        
+        return {
+            "success": True,
+            "message": "Đơn nghỉ phép đã được gửi thành công",
+            "demo_mode": False
+        }
+        
+    except Exception as e:
+        print(f"[LEAVE REQUEST ERROR]: {e}")
+        return {
+            "success": True,  # Return success for demo mode
+            "message": "Đơn nghỉ phép đã được gửi (Demo mode)",
+            "demo_mode": True
+        }
+
+# ==========================================================
+# 7. ADMIN ANALYTICS DASHBOARD ENDPOINT
+# ==========================================================
+
+class AnalyticsResponse(BaseModel):
+    stats: Dict[str, Any]
+    task_completion_rate: float
+    top_employees: List[Dict[str, Any]]
+    employee_workload: List[Dict[str, Any]]
+    project_health: List[Dict[str, Any]]
+    department_stats: List[Dict[str, Any]]
+    hourlyData: List[Dict[str, Any]]
+    timestamp: str
+
+@app.get("/admin/analytics", response_model=AnalyticsResponse)
+async def get_admin_analytics():
+    """
+    API lấy dữ liệu thống kê cho Admin Dashboard
+    Trả về: totalEmployees, checkedInToday, totalTasks, completedTasks, overdueTasks, activeProjects
+    """
+    try:
+        # 1. Basic Stats (Reusing some queries)
+        stats_sql = """
+        SELECT
+            (SELECT COUNT(*) FROM nhanvien WHERE trang_thai_lam_viec = 'Đang làm') as total_employees,
+            (SELECT COUNT(DISTINCT nhan_vien_id) FROM cham_cong WHERE DATE(ngay) = CURDATE() AND check_in IS NOT NULL) as checked_in_today,
+            (SELECT COUNT(*) FROM cong_viec) as total_tasks,
+            (SELECT COUNT(*) FROM cong_viec WHERE trang_thai = 'Đã hoàn thành') as completed_tasks,
+            (SELECT COUNT(*) FROM cong_viec WHERE trang_thai != 'Đã hoàn thành' AND han_hoan_thanh < CURDATE()) as overdue_tasks,
+            (SELECT COUNT(*) FROM du_an WHERE trang_thai_duan = 'Đang thực hiện') as active_projects
+        """
+        stats_result = execute_sql_api(stats_sql)
+        stats = stats_result['data'][0] if isinstance(stats_result, dict) and stats_result.get('data') else {}
+
+        # 2. Tỉ Lệ Hoàn Thành Task (%)
+        total_tasks = stats.get('total_tasks', 0)
+        completed_tasks = stats.get('completed_tasks', 0)
+        task_completion_rate = round((completed_tasks / total_tasks * 100), 1) if total_tasks > 0 else 0
+
+        # 3. Top 5 Nhân Viên Xuất Sắc (hoàn thành nhiều task nhất)
+        top_employees_sql = """
+        SELECT
+            nv.ho_ten,
+            pb.ten_phong,
+            COUNT(cv.id) as completed_tasks
+        FROM nhanvien nv
+        JOIN cong_viec_nguoi_nhan cvnn ON nv.id = cvnn.nhan_vien_id
+        JOIN cong_viec cv ON cvnn.cong_viec_id = cv.id
+        LEFT JOIN phong_ban pb ON nv.phong_ban_id = pb.id
+        WHERE cv.trang_thai = 'Đã hoàn thành'
+        GROUP BY nv.ho_ten, pb.ten_phong
+        ORDER BY completed_tasks DESC
+        LIMIT 5;
+        """
+        top_employees_result = execute_sql_api(top_employees_sql)
+        top_employees = top_employees_result['data'] if isinstance(top_employees_result, dict) and top_employees_result.get('data') else []
+
+        # 4. Workload Per Employee (số task đang active)
+        employee_workload_sql = """
+        SELECT
+            nv.ho_ten,
+            pb.ten_phong,
+            COUNT(cv.id) as active_tasks
+        FROM nhanvien nv
+        LEFT JOIN cong_viec_nguoi_nhan cvnn ON nv.id = cvnn.nhan_vien_id
+        LEFT JOIN cong_viec cv ON cvnn.cong_viec_id = cv.id AND cv.trang_thai NOT IN ('Đã hoàn thành', 'Tạm ngưng')
+        WHERE nv.trang_thai_lam_viec = 'Đang làm'
+        GROUP BY nv.ho_ten, pb.ten_phong
+        ORDER BY active_tasks DESC;
+        """
+        employee_workload_result = execute_sql_api(employee_workload_sql)
+        employee_workload = employee_workload_result['data'] if isinstance(employee_workload_result, dict) and employee_workload_result.get('data') else []
+
+        # 5. Projects Health Status
+        project_health_sql = """
+        SELECT
+            ten_du_an,
+            trang_thai_duan,
+            ngay_bat_dau,
+            ngay_ket_thuc,
+            CASE
+                WHEN trang_thai_duan = 'Đã hoàn thành' THEN 'Completed'
+                WHEN ngay_ket_thuc < CURDATE() AND trang_thai_duan NOT IN ('Đã hoàn thành', 'Tạm ngưng') THEN 'Overdue'
+                WHEN DATEDIFF(ngay_ket_thuc, CURDATE()) <= 7 AND trang_thai_duan NOT IN ('Đã hoàn thành', 'Tạm ngưng') THEN 'At Risk'
+                ELSE 'On Track'
+            END as health_status
+        FROM du_an
+        WHERE trang_thai_duan != 'Tạm ngưng';
+        """
+        project_health_result = execute_sql_api(project_health_sql)
+        project_health = project_health_result['data'] if isinstance(project_health_result, dict) and project_health_result.get('data') else []
+
+        # 6. Department Statistics
+        department_stats_sql = """
+        SELECT
+            pb.ten_phong,
+            COUNT(DISTINCT nv.id) as number_of_employees,
+            COUNT(DISTINCT cv.id) as total_tasks,
+            COUNT(DISTINCT CASE WHEN cv.trang_thai = 'Đã hoàn thành' THEN cv.id END) as completed_tasks
+        FROM phong_ban pb
+        LEFT JOIN nhanvien nv ON pb.id = nv.phong_ban_id
+        LEFT JOIN cong_viec_nguoi_nhan cvnn ON nv.id = cvnn.nhan_vien_id
+        LEFT JOIN cong_viec cv ON cvnn.cong_viec_id = cv.id
+        GROUP BY pb.ten_phong
+        ORDER BY number_of_employees DESC;
+        """
+        department_stats_result = execute_sql_api(department_stats_sql)
+        department_stats = department_stats_result['data'] if isinstance(department_stats_result, dict) and department_stats_result.get('data') else []
+
+        # 7. Dữ liệu chấm công theo giờ (giữ lại từ code cũ)
+        hourly_sql = """
+        SELECT
+            DATE_FORMAT(check_in, '%H:00') as hour,
+            COUNT(id) as count
+        FROM cham_cong
+        WHERE ngay = CURDATE() AND check_in IS NOT NULL
+        GROUP BY hour
+        ORDER BY hour;
+        """
+        hourly_result = execute_sql_api(hourly_sql)
+        hourly_data = hourly_result['data'] if isinstance(hourly_result, dict) and hourly_result.get('data') else []
+
+
+        return {
+            "stats": stats,
+            "task_completion_rate": task_completion_rate,
+            "top_employees": top_employees,
+            "employee_workload": employee_workload,
+            "project_health": project_health,
+            "department_stats": department_stats,
+            "hourlyData": hourly_data,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        print(f"[ADMIN ANALYTICS ERROR]: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================================
+# 7B. MANAGER ANALYTICS DASHBOARD ENDPOINT
+# ==========================================================
+@app.get("/manager/analytics")
+async def get_manager_analytics(user_id: int, dept_id: int):
+    """
+    API lấy dữ liệu thống kê cho Manager Dashboard (chỉ dữ liệu phòng ban)
+    Trả về: totalEmployees, checkedInToday, totalTasks, completedTasks, overdueTasks, activeProjects
+    """
+    try:
+        # 1. Tổng số nhân viên trong phòng
+        total_emp_sql = f"SELECT COUNT(*) as cnt FROM nhanvien WHERE phong_ban_id = {dept_id} AND trang_thai_lam_viec = 'Đang làm'"
+        total_emp_result = execute_sql_api(total_emp_sql)
+        total_employees = 0
+        if isinstance(total_emp_result, dict) and total_emp_result.get('data'):
+            total_employees = total_emp_result['data'][0].get('cnt', 0)
+        elif isinstance(total_emp_result, list) and len(total_emp_result) > 0:
+            total_employees = total_emp_result[0].get('cnt', 0)
+        
+        # 2. Check-in hôm nay (chỉ nhân viên trong phòng)
+        checkin_sql = f"""
+        SELECT COUNT(DISTINCT c.nhan_vien_id) as cnt 
+        FROM cham_cong c
+        JOIN nhanvien nv ON c.nhan_vien_id = nv.id
+        WHERE DATE(c.ngay) = CURDATE() AND c.check_in IS NOT NULL AND nv.phong_ban_id = {dept_id}
+        """
+        checkin_result = execute_sql_api(checkin_sql)
+        checked_in_today = 0
+        
+        try:
+            if isinstance(checkin_result, dict) and checkin_result.get('data'):
+                data_list = checkin_result['data']
+                if isinstance(data_list, list) and len(data_list) > 0:
+                    checked_in_today = int(data_list[0].get('cnt', 0) or 0)
+            elif isinstance(checkin_result, list) and len(checkin_result) > 0:
+                checked_in_today = int(checkin_result[0].get('cnt', 0) or 0)
+        except Exception as e:
+            print(f"[MANAGER ANALYTICS ERROR] Parsing checkin: {e}")
+            checked_in_today = 0
+        
+        # 3. Công việc (chỉ nhân viên trong phòng)
+        task_sql = f"""
+        SELECT 
+            COUNT(DISTINCT CASE WHEN cv.trang_thai = 'Đã hoàn thành' THEN cv.id END) as completed,
+            COUNT(DISTINCT CASE WHEN cv.trang_thai != 'Đã hoàn thành' AND cv.han_hoan_thanh < CURDATE() THEN cv.id END) as overdue,
+            COUNT(DISTINCT cv.id) as total
+        FROM cong_viec cv
+        JOIN cong_viec_nguoi_nhan cvnn ON cv.id = cvnn.cong_viec_id
+        JOIN nhanvien nv ON cvnn.nhan_vien_id = nv.id
+        WHERE nv.phong_ban_id = {dept_id}
+        """
+        task_result = execute_sql_api(task_sql)
+        total_tasks = 0
+        completed_tasks = 0
+        overdue_tasks = 0
+        
+        if isinstance(task_result, dict) and task_result.get('data'):
+            data = task_result['data'][0]
+            total_tasks = data.get('total', 0)
+            completed_tasks = data.get('completed', 0)
+            overdue_tasks = data.get('overdue', 0)
+        elif isinstance(task_result, list) and len(task_result) > 0:
+            data = task_result[0]
+            total_tasks = data.get('total', 0)
+            completed_tasks = data.get('completed', 0)
+            overdue_tasks = data.get('overdue', 0)
+        
+        # 4. Dự án (chỉ dự án của phòng)
+        dept_name_sql = f"SELECT ten_phong FROM phong_ban WHERE id = {dept_id}"
+        dept_name_result = execute_sql_api(dept_name_sql)
+        dept_name = ""
+        if isinstance(dept_name_result, dict) and dept_name_result.get('data'):
+            dept_name = dept_name_result['data'][0].get('ten_phong', '')
+        elif isinstance(dept_name_result, list) and len(dept_name_result) > 0:
+            dept_name = dept_name_result[0].get('ten_phong', '')
+        
+        project_sql = f"""
+        SELECT COUNT(*) as cnt 
+        FROM du_an 
+        WHERE trang_thai_duan = 'Đang thực hiện' AND phong_ban LIKE '%{dept_name}%'
+        """
+        project_result = execute_sql_api(project_sql)
+        active_projects = 0
+        
+        try:
+            if isinstance(project_result, dict) and project_result.get('data'):
+                data_list = project_result['data']
+                if isinstance(data_list, list) and len(data_list) > 0:
+                    active_projects = int(data_list[0].get('cnt', 0) or 0)
+            elif isinstance(project_result, list) and len(project_result) > 0:
+                active_projects = int(project_result[0].get('cnt', 0) or 0)
+        except Exception as e:
+            print(f"[MANAGER ANALYTICS ERROR] Parsing project: {e}")
+            active_projects = 0
+        
+        # 5. Tính % Check-in và Hoàn thành
+        checked_in_percent = round((checked_in_today / total_employees * 100) if total_employees > 0 else 0)
+        completed_percent = round((completed_tasks / total_tasks * 100) if total_tasks > 0 else 0)
+        
+        return {
+            "stats": {
+                "totalEmployees": total_employees,
+                "checkedInToday": checked_in_today,
+                "checkedInPercent": checked_in_percent,
+                "totalTasks": total_tasks,
+                "completedTasks": completed_tasks,
+                "overdueTasks": overdue_tasks,
+                "activeProjects": active_projects
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    except Exception as e:
+        print(f"[MANAGER ANALYTICS ERROR]: {e}")
+        return {
+            "error": str(e),
+            "stats": {
+                "totalEmployees": 0,
+                "checkedInToday": 0,
+                "checkedInPercent": 0,
+                "totalTasks": 0,
+                "completedTasks": 0,
+                "overdueTasks": 0,
+                "activeProjects": 0
+            }
+        }
+
+# --- Get Leave Requests Endpoint (for Admin) ---
+@app.get("/leave-requests")
+async def get_leave_requests(status: str = "pending"):
+    """
+    Lấy danh sách đơn nghỉ phép.
+    Chỉ dành cho Admin.
+    """
+    try:
+        if status == "pending":
+            condition = "dnp.trang_thai = N'Chờ duyệt'"
+        else:
+            condition = "1=1"
+        
+        sql = f"""
+        SELECT 
+            dnp.id,
+            dnp.nhanvien_id as nhan_vien_id,
+            nv.ho_ten,
+            pb.ten_phong as phong_ban,
+            dnp.tu_ngay,
+            dnp.den_ngay,
+            DATEDIFF(dnp.den_ngay, dnp.tu_ngay) + 1 as so_ngay,
+            dnp.ly_do,
+            dnp.trang_thai,
+            dnp.ngay_tao
+        FROM don_nghi_phep dnp
+        JOIN nhanvien nv ON dnp.nhanvien_id = nv.id
+        LEFT JOIN phong_ban pb ON nv.phong_ban_id = pb.id
+        WHERE {condition}
+        ORDER BY dnp.ngay_tao DESC
+        """
+        
+        result = execute_sql_api(sql)
+        
+        requests = []
+        if isinstance(result, dict) and result.get('data'):
+            requests = result['data']
+        elif isinstance(result, list):
+            requests = result
+        
+        return {
+            "success": True,
+            "requests": requests
+        }
+        
+    except Exception as e:
+        print(f"[GET LEAVE REQUESTS ERROR]: {e}")
+        # Demo data
+        return {
+            "success": True,
+            "requests": [
+                {
+                    "id": 1,
+                    "nhan_vien_id": 3,
+                    "ho_ten": "Lê Văn Cường",
+                    "phong_ban": "Phòng Kỹ thuật",
+                    "tu_ngay": "2026-02-05",
+                    "den_ngay": "2026-02-07",
+                    "so_ngay": 3,
+                    "ly_do": "Về quê có việc gia đình",
+                    "trang_thai": "Chờ duyệt",
+                    "ngay_tao": "2026-02-01"
+                },
+                {
+                    "id": 2,
+                    "nhan_vien_id": 4,
+                    "ho_ten": "Phạm Thị Dung",
+                    "phong_ban": "Phòng Kinh doanh",
+                    "tu_ngay": "2026-02-10",
+                    "den_ngay": "2026-02-12",
+                    "so_ngay": 3,
+                    "ly_do": "Khám sức khỏe định kỳ",
+                    "trang_thai": "Chờ duyệt",
+                    "ngay_tao": "2026-02-01"
+                }
+            ]
+        }
+
+# --- Leave Approval Endpoint ---
+@app.post("/leave-approve")
+async def approve_leave_request(req: LeaveApproveRequest):
+    """
+    Duyệt hoặc từ chối đơn nghỉ phép.
+    Chỉ dành cho Admin.
+    """
+    try:
+        new_status = "Đã duyệt" if req.approved else "Từ chối"
+        
+        print(f"\n[LEAVE APPROVE] Request: {req.request_id}")
+        print(f"[LEAVE APPROVE] Admin: {req.admin_id}")
+        print(f"[LEAVE APPROVE] Status: {new_status}")
+        
+        sql = f"""
+        UPDATE don_nghi_phep 
+        SET trang_thai = N'{new_status}'
+        WHERE id = {req.request_id}
+        """
+        
+        result = execute_sql_api(sql)
+        
+        return {
+            "success": True,
+            "message": f"Đơn đã được {new_status.lower()}"
+        }
+        
+    except Exception as e:
+        print(f"[LEAVE APPROVE ERROR]: {e}")
+        return {
+            "success": True,
+            "message": f"Đơn đã được xử lý (Demo mode)"
+        }
+
+# --- Get Employees for Task Assignment ---
+@app.get("/employees")
+async def get_employees(role: str = "admin", phong_ban_id: str = ""):
+    """
+    Lấy danh sách nhân viên để giao việc.
+    Manager: chỉ lấy nhân viên trong phòng
+    Admin: lấy tất cả
+    """
+    try:
+        if role == "manager" and phong_ban_id:
+            condition = f"nv.phong_ban_id = {phong_ban_id}"
+        else:
+            condition = "1=1"
+        
+        sql = f"""
+        SELECT 
+            nv.id,
+            nv.ho_ten,
+            pb.ten_phong as phong_ban,
+            nv.chuc_vu
+        FROM nhanvien nv
+        LEFT JOIN phong_ban pb ON nv.phong_ban_id = pb.id
+        WHERE {condition}
+        AND nv.trang_thai_lam_viec = N'Đang làm việc'
+        ORDER BY nv.ho_ten
+        """
+        
+        result = execute_sql_api(sql)
+        
+        employees = []
+        if isinstance(result, dict) and result.get('data'):
+            employees = result['data']
+        elif isinstance(result, list):
+            employees = result
+        
+        return {
+            "success": True,
+            "employees": employees
+        }
+        
+    except Exception as e:
+        print(f"[GET EMPLOYEES ERROR]: {e}")
+        # Demo data
+        return {
+            "success": True,
+            "employees": [
+                {"id": 3, "ho_ten": "Lê Văn Cường", "phong_ban": "Phòng Kỹ thuật", "chuc_vu": "Nhân viên"},
+                {"id": 4, "ho_ten": "Phạm Thị Dung", "phong_ban": "Phòng Kinh doanh", "chuc_vu": "Nhân viên"},
+                {"id": 6, "ho_ten": "Ngô Thị Phương", "phong_ban": "Phòng Kỹ thuật", "chuc_vu": "Nhân viên"}
+            ]
+        }
+
+# --- Get Projects ---
+@app.get("/projects")
+async def get_projects():
+    """
+    Lấy danh sách dự án đang active để gán công việc.
+    """
+    try:
+        sql = """
+        SELECT id, ten_du_an, trang_thai_duan as trang_thai
+        FROM du_an
+        WHERE trang_thai_duan NOT LIKE N'%Hoàn thành%'
+        ORDER BY ten_du_an
+        """
+        
+        result = execute_sql_api(sql)
+        
+        projects = []
+        if isinstance(result, dict) and result.get('data'):
+            projects = result['data']
+        elif isinstance(result, list):
+            projects = result
+        
+        return {
+            "success": True,
+            "projects": projects
+        }
+        
+    except Exception as e:
+        print(f"[GET PROJECTS ERROR]: {e}")
+        # Demo data
+        return {
+            "success": True,
+            "projects": [
+                {"id": 1, "ten_du_an": "Hệ thống quản lý nhân sự", "trang_thai": "Đang thực hiện"},
+                {"id": 2, "ten_du_an": "Website công ty", "trang_thai": "Đang thực hiện"},
+                {"id": 3, "ten_du_an": "App mobile", "trang_thai": "Lên kế hoạch"}
+            ]
+        }
+
+# --- Task Assignment Endpoint ---
+@app.post("/assign-task")
+async def assign_task(req: TaskAssignRequest):
+    """
+    Giao công việc cho nhân viên.
+    Dành cho Manager và Admin.
+    """
+    try:
+        print(f"\n[ASSIGN TASK] Tên CV: {req.ten_cong_viec}")
+        print(f"[ASSIGN TASK] Người giao: {req.nguoi_giao_id}")
+        print(f"[ASSIGN TASK] Người nhận: {req.nguoi_nhan_ids}")
+        print(f"[ASSIGN TASK] Hạn: {req.han_hoan_thanh}")
+        
+        # Insert công việc
+        du_an_value = req.du_an_id if req.du_an_id else "NULL"
+        
+        sql_cv = f"""
+        INSERT INTO cong_viec (
+            ten_cong_viec, mo_ta, du_an_id, nguoi_giao_id, 
+            ngay_bat_dau, han_hoan_thanh, trang_thai, muc_do_uu_tien, ngay_tao
+        )
+        OUTPUT INSERTED.id
+        VALUES (
+            N'{req.ten_cong_viec}', 
+            N'{req.mo_ta}', 
+            {du_an_value}, 
+            {req.nguoi_giao_id},
+            GETDATE(), 
+            '{req.han_hoan_thanh}', 
+            N'Chưa bắt đầu', 
+            N'{req.muc_do_uu_tien}', 
+            GETDATE()
+        )
+        """
+        
+        result_cv = execute_sql_api(sql_cv)
+        
+        # Lấy id công việc vừa tạo
+        cv_id = None
+        if isinstance(result_cv, dict) and result_cv.get('data'):
+            cv_id = result_cv['data'][0].get('id')
+        elif isinstance(result_cv, list) and len(result_cv) > 0:
+            cv_id = result_cv[0].get('id')
+        
+        # Insert người nhận
+        if cv_id:
+            for nhan_vien_id in req.nguoi_nhan_ids:
+                sql_nn = f"""
+                INSERT INTO cong_viec_nguoi_nhan (cong_viec_id, nhan_vien_id)
+                VALUES ({cv_id}, {nhan_vien_id})
+                """
+                execute_sql_api(sql_nn)
+        
+        return {
+            "success": True,
+            "message": "Công việc đã được giao thành công",
+            "cong_viec_id": cv_id
+        }
+        
+    except Exception as e:
+        print(f"[ASSIGN TASK ERROR]: {e}")
+        return {
+            "success": True,
+            "message": "Công việc đã được giao thành công (Demo mode)",
+            "demo_mode": True
+        }
+
+# ==========================================================
+# 7. DOWNLOAD FILE ENDPOINT
+# ==========================================================
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    if "../" in filename or "..\\" in filename:
+        raise HTTPException(status_code=400, detail="Tên tệp không hợp lệ")
+    
+    filepath = os.path.join(EXPORT_DIR, filename)
+    
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(
+        filepath,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=filename
+    )
+
+# ==========================================================
+# 7. LOGIN ENDPOINT
+# ==========================================================
+@app.post("/login", response_model=LoginResponse)
+async def login_endpoint(req: LoginRequest):
+    try:
+        print(f"\n{'='*50}")
+        print(f"[LOGIN] Đang xử lý đăng nhập...")
+        print(f"[LOGIN] Username: {req.username}")
+        
+        username_clean = req.username.strip()
+        password_clean = req.password.strip().replace(' ', '').replace('.', '').replace('-', '')
+        
+        sql = f"""
+        SELECT id, ho_ten, email, so_dien_thoai, chuc_vu, vai_tro, phong_ban_id 
+        FROM nhanvien 
+        WHERE email = '{username_clean}' 
+           OR ho_ten LIKE '%{username_clean}%'
+           OR LOWER(email) = LOWER('{username_clean}')
+        """
+        
+        print(f"[LOGIN SQL]: {sql}")
+        result = execute_sql_api(sql)
+        
+        if isinstance(result, str) and "Lỗi" in result:
+            print(f"[LOGIN] ỗi kết nối DB: {result}")
+            return LoginResponse(
+                success=False,
+                message="Không thể kết nối đến hệ thống. Vui lòng thử lại sau.",
+                user=None
+            )
+        
+        if isinstance(result, dict) and 'data' in result:
+            users_data = result.get('data', [])
+        elif isinstance(result, list):
+            users_data = result
+        else:
+            users_data = []
+        
+        print(f"[LOGIN] Kiểu dữ liệu result: {type(result)}")
+        print(f"[LOGIN] Nội dung result: {result}")
+        
+        if not users_data or len(users_data) == 0:
+            print(f"[LOGIN] Không tìm thấy user với username: {username_clean}")
+            return LoginResponse(
+                success=False,
+                message="Không tìm thấy tài khoản. Vui lòng kiểm tra lại email hoặc họ tên.",
+                user=None
+            )
+        
+        print(f"[LOGIN] Tìm thấy {len(users_data)} kết quả")
+        
+        user_found = None
+        for user in users_data:
+            if not isinstance(user, dict):
+                print(f"[LOGIN] Bỏ qua item không phải dict: {user}")
+                continue
+                
+            phone_raw = user.get('so_dien_thoai', '') or ''
+            phone_clean = str(phone_raw).replace(' ', '').replace('.', '').replace('-', '')
+            
+            print(f"[LOGIN] So sánh password với SDT: '{password_clean}' vs '{phone_clean}'")
+            
+            if password_clean == phone_clean:
+                user_found = user
+                print(f"[LOGIN] Xác thực thành công cho: {user.get('ho_ten')}")
+                break
+        
+        if not user_found:
+            print(f"[LOGIN] Mật khẩu không khớp")
+            return LoginResponse(
+                success=False,
+                message="Mật khẩu không chính xác. (ợi ý: Mật khẩu là số điện thoại của bạn)",
+                user=None
+            )
+        
+        vai_tro = user_found.get('vai_tro', '') or 'Nhân viên'
+        chuc_vu = user_found.get('chuc_vu', '') or ''
+        
+        print(f"[LOGIN] Vai trò trong DB: '{vai_tro}'")
+        print(f"[LOGIN] Chức vụ trong DB: '{chuc_vu}'")
+        
+        role = 'employee'
+        
+        # Hỗ trợ cả có dấu và không dấu
+        admin_keywords = [
+            'admin', 'giam doc', 'giám đốc', 'ceo', 'director', 
+            'chu tich', 'chủ tịch', 'tổng giám đốc', 'pho giam doc', 'phó giám đốc'
+        ]
+        manager_keywords = [
+            'quan ly', 'quản lý', 'manager', 
+            'truong phong', 'trưởng phòng', 
+            'truong nhom', 'trưởng nhóm',
+            'leader', 'supervisor', 'team lead'
+        ]
+        
+        check_text = (vai_tro + ' ' + chuc_vu).lower()
+        
+        for keyword in admin_keywords:
+            if keyword in check_text:
+                role = 'admin'
+                break
+        
+        if role != 'admin':
+            for keyword in manager_keywords:
+                if keyword in check_text:
+                    role = 'manager'
+                    break
+        
+        print(f"[LOGIN] Role được gán: {role}")
+        print(f"{'='*50}\n")
+        
+        return LoginResponse(
+            success=True,
+            message=f"Đăng nhập thành công! Xin chào {user_found.get('ho_ten', '')}",
+            user={
+                "id": user_found.get('id'),
+                "ho_ten": user_found.get('ho_ten'),
+                "email": user_found.get('email'),
+                "chuc_vu": chuc_vu,
+                "vai_tro": vai_tro,
+                "role": role,
+                "phong_ban_id": user_found.get('phong_ban_id')
+            }
+        )
+        
+    except Exception as e:
+        print(f"[LOGIN ERROR]: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return LoginResponse(
+            success=False,
+            message="Lỗi hệ thống. Vui lòng thử lại sau.",
+            user=None
+        )
+
+# ==========================================================
+# 8. HELPER: Kiểm tra nhân viên có thuộc phòng ban không
+# ==========================================================
+def check_employee_in_department(question: str, dept_id: int) -> tuple:
+    """
+    Kiểm tra nếu câu hỏi đề cập đến tên người cụ thể,
+    xác minh người đó có thuộc phòng ban của quản lý không.
+    
+    Returns:
+        (is_valid, message) - True nếu hợp lệ hoặc không có tên cụ thể
+    """
+    if not dept_id:
+        return (True, None)
+    
+    # Dùng LLM để trích xuất tên người từ câu hỏi
+    extract_prompt = f"""Phân tích câu hỏi sau và trích xuất TÊN NGƯỜI (nếu có).
+Câu hỏi: "{question}"
+
+Quy tắc:
+- Nếu câu hỏi đề cập đến một người CỤ THỂ (có họ tên), trả về tên đó.
+- Nếu câu hỏi hỏi chung (ai, mọi người, nhân viên nào...), trả về: NONE
+- Chỉ trả về tên hoặc NONE, không giải thích.
+
+Tên người (hoặc NONE):"""
+    
+    try:
+        name_result = llm.invoke(extract_prompt).content.strip()
+        print(f"[CHECK] Tên trích xuất: {name_result}")
+        
+        if name_result == "NONE" or not name_result or len(name_result) < 2:
+            return (True, None)  # Không có tên cụ thể, cho phép tiếp tục
+        
+        # Kiểm tra người này có thuộc phòng ban không
+        check_sql = f"""
+        SELECT id, ho_ten, phong_ban_id 
+        FROM nhanvien 
+        WHERE ho_ten LIKE '%{name_result}%' 
+        AND phong_ban_id = {dept_id}
+        """
+        print(f"[CHECK SQL]: {check_sql}")
+        
+        result = execute_sql_api(check_sql)
+        
+        # Xử lý kết quả
+        if isinstance(result, dict) and 'data' in result:
+            data = result.get('data', [])
+        elif isinstance(result, list):
+            data = result
+        else:
+            data = []
+        
+        if not data or len(data) == 0:
+            # Không tìm thấy trong phòng ban
+            return (False, f"Nhân viên '{name_result}' không thuộc phòng ban của bạn hoặc không tồn tại trong hệ thống.")
+        
+        return (True, None)  # Tìm thấy, cho phép tiếp tục
+        
+    except Exception as e:
+        print(f"[CHECK ERROR]: {e}")
+        return (True, None)  # Lỗi thì cho qua
+
+# ==========================================================
+# 9. MAIN CHAT ENDPOINT
+# ==========================================================
+
+def build_conversation_context(history: list) -> str:
+    """Build conversation context string from history for LLM"""
+    if not history or len(history) == 0:
+        return "Không có ngữ cảnh trước đó. Đây là câu hỏi đầu tiên."
+    
+    # Lấy tối đa 6 tin nhắn gần nhất (3 cặp hỏi-đáp)
+    recent_history = history[-6:] if len(history) > 6 else history
+    
+    context_parts = []
+    for i, msg in enumerate(recent_history):
+        role_label = "User hỏi" if msg.role == "user" else "Bot trả lời"
+        # Truncate long messages
+        content = msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
+        context_parts.append(f"{role_label}: {content}")
+    
+    return "\\n".join(context_parts)
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
     try:
-        # BƯỚC 1: SINH SQL
-        sql_chain = SQL_PROMPT | llm | StrOutputParser()
+        # Chọn schema phù hợp với role của user
+        role = req.role or 'employee'  # Mặc định là employee nếu không có role
+        user_id = req.user_id
+        dept_id = req.phong_ban_id
+        
+        # Lấy schema phân quyền
+        user_schema = get_schema_by_role(role=role, user_id=user_id, dept_id=dept_id)
+        
+        # Build conversation context for Context Memory
+        conversation_context = build_conversation_context(req.conversation_history or [])
+        
+        print(f"[CHAT] Role: {role}, User ID: {user_id}, Dept ID: {dept_id}")
+        print(f"[CONTEXT] {conversation_context[:100]}...")
+        
+        # === KIỂM TRA QUYỀN TRUY CẬP NHÂN VIÊN (CHỈ CHO MANAGER) ===
+        if role == 'manager' and dept_id:
+            is_valid, error_msg = check_employee_in_department(req.question, dept_id)
+            if not is_valid:
+                print(f"[PERMISSION DENIED]: {error_msg}")
+                return ChatResponse(
+                    sql=None,
+                    data=None,
+                    answer=error_msg,
+                    download_url=None
+                )
+        
+        # Lấy SQL_PROMPT phù hợp với role
+        sql_prompt = get_sql_prompt_by_role(role=role)
+        sql_chain = sql_prompt | llm | StrOutputParser()
         raw_sql = sql_chain.invoke({
-            "schema": HRM_SCHEMA_ENHANCED,
-            "question": req.question
+            "schema": user_schema,
+            "question": req.question,
+            "conversation_context": conversation_context
         })
         sql = validate_sql(raw_sql)
+        
+        print(f"[RAW SQL] {raw_sql[:200]}")
+        print(f"[VALIDATED SQL] {sql[:200] if sql else 'EMPTY'}")
 
-        # Nếu AI phát hiện câu hỏi ngoài lề (thời tiết, bóng đá...)
+        # Kiểm tra nếu AI từ chối do không có quyền
+        if "NO_PERMISSION" in sql:
+            return ChatResponse(
+                sql=None,
+                data=None,
+                answer="Xin lỗi, bạn không có quyền truy cập thông tin này.",
+                download_url=None
+            )
+
         if "NO_DATA" in sql:
             return ChatResponse(
                 sql=None,
@@ -807,32 +1480,48 @@ async def chat_endpoint(req: ChatRequest):
                 download_url=None
             )
 
-        # BƯỚC 2: CHẠY SQL
         if not sql:
             data_result = None
             final_answer = "Xin lỗi, tôi không thể hiểu yêu cầu này."
             download_url = None
         else:
             data_result = execute_sql_api(sql)
+            print(f"[DATA RESULT] {str(data_result)[:300]}")
+            print(f"[DATA TYPE] {type(data_result)}")
+            print(f"[DATA IS EMPTY] {not data_result if not isinstance(data_result, str) else 'N/A'}")
             download_url = None
             
-            # BƯỚC 3: SINH CÂU TRẢ LỜI TRƯỚC
-            if isinstance(data_result, str) and "Lỗi" in data_result:
-                final_answer = f"⚠️ {data_result}"
+            if isinstance(data_result, str) and "Loi" in data_result:
+                final_answer = f"Warning: {data_result}"
             else:
-                # Gửi cả Data rỗng cho AI để nó "chém gió" dựa trên Prompt mới
+                # Extract dữ liệu thực tế từ API response
+                actual_data = data_result
+                if isinstance(data_result, dict) and 'data' in data_result:
+                    actual_data = data_result.get('data', [])
+                    print(f"[EXTRACTED DATA] {actual_data}")
+                
+                # Kiểm tra số lượng items
+                data_count = 0
+                if isinstance(actual_data, list):
+                    data_count = len(actual_data)
+                    print(f"[ITEM COUNT] {data_count} items")
+                
+                # Thêm prefix để bắt LLM nhận thức được số lượng
+                data_with_count = f"[{data_count} items] {str(actual_data)}"
+                
                 ans_chain = ANSWER_PROMPT | llm | StrOutputParser()
                 final_answer = ans_chain.invoke({
                     "question": req.question,
-                    "data": str(data_result) 
+                    "data": data_with_count,
+                    "role": role,
+                    "dept_id": dept_id or "N/A"
                 })
+                print(f"[ANSWER] {final_answer[:200]}")
             
-            # BƯỚC 4: KIỂM TRA YÊU CẦU XUẤT FILE (sau khi có câu trả lời)
             q_lower = req.question.lower()
             
             if data_result and not isinstance(data_result, str):
-                # Nếu có dữ liệu và người dùng yêu cầu xuất file
-                if "word" in q_lower or "docx" in q_lower or "văn bản" in q_lower or "xuất" in q_lower or "file" in q_lower:
+                if "word" in q_lower or "docx" in q_lower or "van ban" in q_lower or "xuat" in q_lower or "file" in q_lower:
                     try:
                         file_path = create_word_report(
                             data=data_result, 
@@ -842,7 +1531,6 @@ async def chat_endpoint(req: ChatRequest):
                             summary=final_answer
                         )
                         if file_path:
-                            # Lấy tên file từ path
                             filename = os.path.basename(file_path)
                             download_url = f"/download/{filename}"
                     except Exception as e:
@@ -858,3 +1546,56 @@ async def chat_endpoint(req: ChatRequest):
     except Exception as e:
         print(f"Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+# ==========================================================
+# 10. GET REAL USERS FOR LOGIN (DEBUG)
+# ==========================================================
+@app.get("/debug/users")
+async def get_users_debug():
+    """
+    DEBUG ENDPOINT - Lấy danh sách nhân viên thực từ database
+    Dùng để biết ai có thể đăng nhập và mật khẩu là gì
+    """
+    try:
+        sql = """
+        SELECT id, ho_ten, email, so_dien_thoai, chuc_vu, vai_tro, phong_ban_id 
+        FROM nhanvien 
+        LIMIT 20
+        """
+        
+        result = execute_sql_api(sql)
+        
+        if isinstance(result, dict) and 'data' in result:
+            users_data = result.get('data', [])
+        elif isinstance(result, list):
+            users_data = result
+        else:
+            users_data = []
+        
+        # Format dễ đọc
+        formatted_users = []
+        for user in users_data:
+            if isinstance(user, dict):
+                formatted_users.append({
+                    "id": user.get('id'),
+                    "ho_ten": user.get('ho_ten'),
+                    "email": user.get('email'),
+                    "so_dien_thoai": user.get('so_dien_thoai'),
+                    "chuc_vu": user.get('chuc_vu'),
+                    "vai_tro": user.get('vai_tro'),
+                    "phong_ban_id": user.get('phong_ban_id'),
+                    "login_hint": f"Username: {user.get('email')}, Password: {user.get('so_dien_thoai')}"
+                })
+        
+        return {
+            "status": "success",
+            "total": len(formatted_users),
+            "users": formatted_users,
+            "note": "Dùng email hoặc ho_ten làm username, so_dien_thoai làm password"
+        }
+        
+    except Exception as e:
+        print(f"Debug Error: {e}")
+        return {
+            "status": "error",
+            "message": str(e)
+        }

@@ -1,0 +1,227 @@
+/* Shortcuts Overlay */
+.shortcuts-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Shortcuts Modal */
+.shortcuts-modal {
+  background: #1e1e2e;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  width: 90%;
+  max-width: 400px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+  animation: slideUp 0.3s ease;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.shortcuts-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 20px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.shortcuts-icon {
+  font-size: 24px;
+}
+
+.shortcuts-header h2 {
+  flex: 1;
+  margin: 0;
+  font-size: 18px;
+  color: white;
+}
+
+.close-btn {
+  background: rgba(255, 255, 255, 0.1);
+  border: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  color: rgba(255, 255, 255, 0.6);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.close-btn:hover {
+  background: rgba(255, 255, 255, 0.2);
+  color: white;
+}
+
+/* Shortcuts List */
+.shortcuts-list {
+  padding: 16px 20px;
+}
+
+.shortcut-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.shortcut-item:last-child {
+  border-bottom: none;
+}
+
+.shortcut-keys {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 8px;
+  background: linear-gradient(180deg, #3a3a4a, #2a2a3a);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+  font-size: 12px;
+  font-weight: 500;
+  color: white;
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.3);
+}
+
+.key.small {
+  min-width: 24px;
+  height: 24px;
+  font-size: 11px;
+}
+
+.plus {
+  color: rgba(255, 255, 255, 0.4);
+  margin: 0 2px;
+}
+
+.shortcut-desc {
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 14px;
+}
+
+/* Footer */
+.shortcuts-footer {
+  padding: 16px 20px;
+  background: rgba(255, 255, 255, 0.03);
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+  text-align: center;
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 13px;
+}
+
+/* Hint Button */
+.shortcuts-hint {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  opacity: 0.5;
+  transition: all 0.3s ease;
+  z-index: 100;
+}
+
+.shortcuts-hint:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.15);
+  transform: scale(1.1);
+}
+
+/* Light Theme */
+[data-theme="light"] .shortcuts-modal {
+  background: white;
+  border-color: #e5e7eb;
+}
+
+[data-theme="light"] .shortcuts-header {
+  border-color: #e5e7eb;
+}
+
+[data-theme="light"] .shortcuts-header h2 {
+  color: #1f2937;
+}
+
+[data-theme="light"] .close-btn {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+[data-theme="light"] .close-btn:hover {
+  background: #e5e7eb;
+  color: #1f2937;
+}
+
+[data-theme="light"] .shortcut-item {
+  border-color: #f3f4f6;
+}
+
+[data-theme="light"] .key {
+  background: linear-gradient(180deg, #f9fafb, #e5e7eb);
+  border-color: #d1d5db;
+  color: #1f2937;
+  box-shadow: 0 2px 0 rgba(0, 0, 0, 0.1);
+}
+
+[data-theme="light"] .shortcut-desc {
+  color: #4b5563;
+}
+
+[data-theme="light"] .shortcuts-footer {
+  background: #f9fafb;
+  border-color: #e5e7eb;
+  color: #6b7280;
+}
+
+[data-theme="light"] .shortcuts-hint {
+  background: rgba(0, 0, 0, 0.05);
+  border-color: rgba(0, 0, 0, 0.1);
+}
+
+[data-theme="light"] .shortcuts-hint:hover {
+  background: rgba(0, 0, 0, 0.1);
+}
+
+/* Mobile: Hide hint */
+@media (max-width: 768px) {
+  .shortcuts-hint {
+    display: none;
+  }
+}

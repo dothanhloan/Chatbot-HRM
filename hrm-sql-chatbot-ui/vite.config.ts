@@ -8,5 +8,8 @@ export default defineConfig({
     allowedHosts: [
       '.ngrok-free.dev'
     ]
-  }
+  },
+  optimizeDeps: {
+    include: ['docx'],
+  },
 })
